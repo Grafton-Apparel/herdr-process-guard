@@ -9,11 +9,18 @@ permissions:
 
 jobs:
   release:
-    runs-on: macos-15
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest, macos-15]
         arch: [arm64, amd64]
+        include:
+          - os: ubuntu-latest
+            platform: linux
+          - os: macos-15
+            platform: darwin
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -29,10 +36,11 @@ jobs:
         run: go test ./...
       - name: Build archive
         env:
+          GOOS: ${{ matrix.platform }}
           GOARCH: ${{ matrix.arch }}
           CGO_ENABLED: "0"
         run: |
-          archive="herdr-process-guard_${GITHUB_REF_NAME#v}_darwin_${GOARCH}"
+          archive="herdr-process-guard_${GITHUB_REF_NAME#v}_${GOOS}_${GOARCH}"
           mkdir -p "dist/${archive}"
           go build -trimpath -ldflags="-s -w" -o "dist/${archive}/herdr-process-guard" ./cmd/herdr-process-guard
           cp README.md LICENSE herdr-plugin.toml "dist/${archive}/"
@@ -40,7 +48,7 @@ jobs:
           (cd dist && shasum -a 256 "${archive}.tar.gz" > "${archive}.tar.gz.sha256")
       - uses: actions/upload-artifact@v7
         with:
-          name: darwin-${{ matrix.arch }}
+          name: ${{ matrix.platform }}-${{ matrix.arch }}
           path: |
             dist/*.tar.gz
             dist/*.sha256
