@@ -32,7 +32,7 @@ func (s *Scanner) Pin(expected model.Process) (*PinnedProcess, error) {
 	if s.Run != nil || (s.ProcRoot != "" && s.ProcRoot != "/proc") {
 		return nil, errors.New("pin requires the live /proc scanner")
 	}
-	if expected.Key.PID <= 1 || expected.UID != os.Getuid() || s.UID != os.Getuid() || expected.Key.BootID == "" || expected.Key.StartTicks == 0 || expected.Executable == "" || expected.Command == "" || expected.CommandHash == "" || !expected.TelemetryComplete || !expected.SocketsComplete || !expected.IOComplete || !expected.ChildrenComplete {
+	if expected.Key.PID <= 1 || expected.UID != os.Getuid() || s.UID != os.Getuid() || expected.Key.BootID == "" || expected.Key.StartTicks == 0 || expected.Executable == "" || expected.ExecutableInode == 0 || expected.Command == "" || expected.CommandHash == "" || !expected.TelemetryComplete || !expected.SocketsComplete || !expected.IOComplete || !expected.ChildrenComplete {
 		return nil, errors.New("incomplete or foreign process identity")
 	}
 	fd, err := unix.PidfdOpen(expected.Key.PID, 0)
@@ -67,13 +67,13 @@ func (p *PinnedProcess) revalidateLocked() error {
 		return fmt.Errorf("pinned process telemetry unavailable: %v", err)
 	}
 	e := p.expected
-	if current.Key != e.Key || current.UID != e.UID || current.Executable != e.Executable || current.Command != e.Command || current.CommandHash != e.CommandHash || current.PPID != e.PPID || current.PGID != e.PGID || current.SessionID != e.SessionID || !slices.Equal(current.Children, e.Children) {
+	if current.Key != e.Key || current.UID != e.UID || current.Executable != e.Executable || current.ExecutableDevice != e.ExecutableDevice || current.ExecutableInode != e.ExecutableInode || current.Command != e.Command || current.CommandHash != e.CommandHash || current.PPID != e.PPID || current.PGID != e.PGID || current.SessionID != e.SessionID || !slices.Equal(current.Children, e.Children) {
 		return errors.New("pinned process identity changed")
 	}
 	return nil
 }
 
-// Revalidate checks boot/start, UID, executable, exact argv hash, displayed
+// Revalidate checks boot/start, UID, executable path/device/inode, argv hash, displayed
 // command, parent/group/session membership, and current telemetry completeness.
 func (p *PinnedProcess) Revalidate() error {
 	p.mu.Lock()

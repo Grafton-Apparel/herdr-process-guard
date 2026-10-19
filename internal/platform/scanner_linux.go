@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/Efeguclu1/herdr-process-guard/internal/model"
+	"golang.org/x/sys/unix"
 )
 
 var errGraphIncomplete = errors.New("process ancestry graph incomplete")
@@ -265,6 +266,10 @@ func (s *Scanner) readProcess(pid int, boot string, bootTime int64, ticks uint64
 	if err != nil || p.Executable == "" {
 		gaps = append(gaps, fmt.Errorf("executable unavailable: %v", err))
 	}
+	p.ExecutableDevice, p.ExecutableInode, err = executableIdentity(filepath.Join(dir, "exe"))
+	if err != nil {
+		gaps = append(gaps, fmt.Errorf("executable file identity unavailable: %w", err))
+	}
 	cmd, err := readBounded(filepath.Join(dir, "cmdline"))
 	if err != nil || len(cmd) == 0 {
 		gaps = append(gaps, fmt.Errorf("command unavailable: %v", err))
@@ -288,7 +293,7 @@ func (s *Scanner) readProcess(pid int, boot string, bootTime int64, ticks uint64
 	} else {
 		p.IOComplete = true
 	}
-	p.Sockets, err = readProcessSockets(dir)
+	p.Sockets, err = readProcessSockets(dir, uid)
 	if err != nil {
 		gaps = append(gaps, fmt.Errorf("sockets unavailable: %w", err))
 	} else {
@@ -304,6 +309,10 @@ func (s *Scanner) readProcess(pid int, boot string, bootTime int64, ticks uint64
 	afterExe, e := os.Readlink(filepath.Join(dir, "exe"))
 	if e != nil || afterExe != p.Executable {
 		gaps = append(gaps, errors.New("executable unavailable or changed during read"))
+	}
+	afterDevice, afterInode, e := executableIdentity(filepath.Join(dir, "exe"))
+	if e != nil || afterDevice != p.ExecutableDevice || afterInode != p.ExecutableInode {
+		gaps = append(gaps, errors.New("executable file identity unavailable or changed during read"))
 	}
 	afterCmd, e := readBounded(filepath.Join(dir, "cmdline"))
 	if e != nil || string(afterCmd) != string(cmd) {
@@ -400,7 +409,77 @@ func readProcessChildren(dir string) ([]int, error) {
 	return slices.Compact(children), nil
 }
 
-func socketInodes(dir string) (map[string]bool, error) {
+func executableIdentity(path string) (uint64, uint64, error) {
+	var st unix.Stat_t
+	if err := unix.Stat(path, &st); err != nil {
+		return 0, 0, err
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG || st.Ino == 0 {
+		return 0, 0, errors.New("invalid executable file identity")
+	}
+	return uint64(st.Dev), st.Ino, nil
+}
+
+type threadIdentity struct {
+	TID        int
+	StartTicks uint64
+}
+
+func readThreadIdentities(dir string, uid int) ([]threadIdentity, error) {
+	entries, err := readEntries(filepath.Join(dir, "task"))
+	if err != nil {
+		return nil, err
+	}
+	processID, err := strconv.Atoi(filepath.Base(dir))
+	if err != nil {
+		return nil, err
+	}
+	threads := []threadIdentity{}
+	for _, entry := range entries {
+		tid, err := strconv.Atoi(entry.Name())
+		if err != nil || tid <= 0 {
+			continue
+		}
+		task := filepath.Join(dir, "task", entry.Name())
+		stat, err := readBounded(filepath.Join(task, "stat"))
+		if err != nil {
+			return nil, err
+		}
+		identity, err := parseLinuxStat(stat)
+		if err != nil || identity.pid != tid {
+			return nil, errors.New("invalid thread identity")
+		}
+		taskUID, err := readUID(filepath.Join(task, "status"))
+		if err != nil || taskUID != uid {
+			return nil, errors.New("thread credentials unavailable or changed")
+		}
+		status, err := readBounded(filepath.Join(task, "status"))
+		if err != nil {
+			return nil, err
+		}
+		tgid := 0
+		for _, line := range strings.Split(string(status), "\n") {
+			f := strings.Fields(line)
+			if len(f) == 2 && f[0] == "Tgid:" {
+				tgid, err = strconv.Atoi(f[1])
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+		if tgid != processID {
+			return nil, errors.New("thread group identity unavailable or changed")
+		}
+		threads = append(threads, threadIdentity{TID: tid, StartTicks: identity.start})
+	}
+	if len(threads) == 0 {
+		return nil, errors.New("missing process threads")
+	}
+	slices.SortFunc(threads, func(a, b threadIdentity) int { return a.TID - b.TID })
+	return threads, nil
+}
+
+func socketInodes(dir string, remaining *int) (map[string]bool, error) {
 	// Keep the directory open through readlink. For /proc/self/fd the directory's
 	// own FD appears in its listing and must not disappear before readlink.
 	f, err := os.Open(filepath.Join(dir, "fd"))
@@ -412,7 +491,8 @@ func socketInodes(dir string) (map[string]bool, error) {
 	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, err
 	}
-	if len(entries) > maxProcEntries {
+	*remaining -= len(entries)
+	if len(entries) > maxProcEntries || *remaining < 0 {
 		return nil, errors.New("FD entry limit exceeded")
 	}
 	wanted := map[string]bool{}
@@ -427,11 +507,67 @@ func socketInodes(dir string) (map[string]bool, error) {
 	}
 	return wanted, nil
 }
-func readProcessSockets(dir string) ([]model.Socket, error) {
-	wanted, err := socketInodes(dir)
+func readProcessSockets(dir string, uid int) ([]model.Socket, error) {
+	before, err := readThreadIdentities(dir, uid)
 	if err != nil {
 		return nil, err
 	}
+	perThread := map[int]map[string]bool{}
+	remaining := maxProcEntries
+	sockets := []model.Socket{}
+	seen := map[model.Socket]bool{}
+	for _, thread := range before {
+		task := filepath.Join(dir, "task", strconv.Itoa(thread.TID))
+		wanted, err := socketInodes(task, &remaining)
+		if err != nil {
+			return nil, err
+		}
+		perThread[thread.TID] = wanted
+		found, err := readSocketTables(task, wanted)
+		if err != nil {
+			return nil, err
+		}
+		for _, socket := range found {
+			if !seen[socket] {
+				sockets = append(sockets, socket)
+				seen[socket] = true
+			}
+		}
+	}
+	after, err := readThreadIdentities(dir, uid)
+	if err != nil {
+		return nil, err
+	}
+	if !slices.Equal(before, after) {
+		return nil, errors.New("thread identities changed during socket read")
+	}
+	remaining = maxProcEntries
+	for _, thread := range after {
+		wanted := perThread[thread.TID]
+		current, err := socketInodes(filepath.Join(dir, "task", strconv.Itoa(thread.TID)), &remaining)
+		if err != nil {
+			return nil, err
+		}
+		if len(current) != len(wanted) {
+			return nil, errors.New("thread socket descriptors changed during read")
+		}
+		for inode := range current {
+			if !wanted[inode] {
+				return nil, errors.New("thread socket descriptors changed during read")
+			}
+		}
+	}
+	final, err := readThreadIdentities(dir, uid)
+	if err != nil {
+		return nil, err
+	}
+	if !slices.Equal(before, final) {
+		return nil, errors.New("thread identities changed during socket read")
+	}
+	return sockets, nil
+}
+
+func readSocketTables(dir string, wanted map[string]bool) ([]model.Socket, error) {
 
 	// Reading the tables even with no FDs detects inaccessible socket telemetry.
 	sockets := []model.Socket{}
@@ -501,18 +637,6 @@ func readProcessSockets(dir string) ([]model.Socket, error) {
 	for inode := range wanted {
 		if !known[inode] {
 			return nil, fmt.Errorf("unresolved socket inode %s", inode)
-		}
-	}
-	after, err := socketInodes(dir)
-	if err != nil {
-		return nil, err
-	}
-	if len(after) != len(wanted) {
-		return nil, errors.New("socket descriptors changed during read")
-	}
-	for inode := range after {
-		if !wanted[inode] {
-			return nil, errors.New("socket descriptors changed during read")
 		}
 	}
 	return sockets, nil

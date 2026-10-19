@@ -4,7 +4,6 @@ package platform
 
 import (
 	"fmt"
-	"golang.org/x/sys/unix"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Efeguclu1/herdr-process-guard/internal/model"
+	"golang.org/x/sys/unix"
 )
 
 func procFixture(t *testing.T) *Scanner {
@@ -42,7 +42,8 @@ func fixtureProcess(t *testing.T, s *Scanner, pid int) {
 	writeFixture(t, s.ProcRoot, base+"/cmdline", "/usr/bin/node\x00server.js\x00")
 	writeFixture(t, s.ProcRoot, base+"/task/"+base+"/children", "")
 	writeFixture(t, s.ProcRoot, base+"/io", "rchar: 50\nwchar: 60\nread_bytes: 10\nwrite_bytes: 20\n")
-	for name, target := range map[string]string{"exe": "/usr/bin/node", "cwd": "/work"} {
+	writeFixture(t, s.ProcRoot, "fixture-executable", "executable")
+	for name, target := range map[string]string{"exe": filepath.Join(s.ProcRoot, "fixture-executable"), "cwd": "/work"} {
 		if err := os.Symlink(target, filepath.Join(s.ProcRoot, base, name)); err != nil {
 			t.Fatal(err)
 		}
@@ -53,6 +54,7 @@ func fixtureProcess(t *testing.T, s *Scanner, pid int) {
 	for _, name := range []string{"tcp", "tcp6", "udp", "udp6", "unix"} {
 		writeFixture(t, s.ProcRoot, base+"/net/"+name, "header\n")
 	}
+	fixtureThread(t, s, pid, pid)
 }
 func TestLinuxProcSnapshot(t *testing.T) {
 	s := procFixture(t)
@@ -143,7 +145,7 @@ func TestLinuxPinRejectsChangedIdentityAndTerminatesChild(t *testing.T) {
 		t.Fatalf("child missing/incomplete: %+v", p)
 	}
 	for _, change := range []func(*model.Process){func(p *model.Process) { p.Key.StartTicks++ },
-		func(p *model.Process) { p.Key.PID = os.Getpid() }, func(p *model.Process) { p.UID++ }, func(p *model.Process) { p.Executable += "-changed" }, func(p *model.Process) { p.CommandHash = "changed" }, func(p *model.Process) { p.Key.BootID = "changed" }, func(p *model.Process) { p.Command = "changed" }} {
+		func(p *model.Process) { p.Key.PID = os.Getpid() }, func(p *model.Process) { p.UID++ }, func(p *model.Process) { p.Executable += "-changed" }, func(p *model.Process) { p.ExecutableDevice++ }, func(p *model.Process) { p.ExecutableInode++ }, func(p *model.Process) { p.ExecutableInode = 0 }, func(p *model.Process) { p.CommandHash = "changed" }, func(p *model.Process) { p.Key.BootID = "changed" }, func(p *model.Process) { p.Command = "changed" }} {
 		bad := p
 		change(&bad)
 		if pin, err := s.Pin(bad); err == nil {
@@ -290,13 +292,11 @@ func TestLinuxBoundsProcReads(t *testing.T) {
 }
 
 func TestLinuxScannerCanReadItsOwnFDs(t *testing.T) {
-	s := NewScanner()
-	ps, warnings, err := s.Processes()
-	if err != nil {
+	// Exercise the self-directory FD lifetime without requiring the Go runtime's
+	// complete thread membership to remain fixed throughout a whole-host scan.
+	remaining := maxProcEntries
+	if _, err := socketInodes("/proc/self", &remaining); err != nil {
 		t.Fatal(err)
-	}
-	if !ps[os.Getpid()].SocketsComplete {
-		t.Fatalf("self observation incomplete: %+v warnings=%v", ps[os.Getpid()], warnings)
 	}
 }
 
@@ -410,6 +410,7 @@ func TestLinuxKernelChildrenIncludeForeignUIDAndThreadForks(t *testing.T) {
 	fixtureProcess(t, s, 42)
 	fixtureProcess(t, s, 99)
 	writeFixture(t, s.ProcRoot, "99/status", fmt.Sprintf("Uid:\t%d\t%d\t%d\t%d\n", s.UID+1, s.UID+1, s.UID+1, s.UID+1))
+	fixtureThread(t, s, 42, 43)
 	writeFixture(t, s.ProcRoot, "42/task/43/children", "99 ")
 	ps, warnings, err := s.Processes()
 	if err != nil {
@@ -435,5 +436,252 @@ func TestLinuxChildrenGapBlocksOnlyAffectedTarget(t *testing.T) {
 	}
 	if !s.GraphComplete || ps[42].ChildrenComplete || ps[42].TelemetryComplete || len(warnings) == 0 {
 		t.Fatalf("children gap accepted: graph=%v %+v %v", s.GraphComplete, ps[42], warnings)
+	}
+}
+
+func fixtureThread(t *testing.T, s *Scanner, pid, tid int) {
+	t.Helper()
+	base := fmt.Sprint(pid)
+	task := fmt.Sprintf("%d/task/%d", pid, tid)
+	stat, err := os.ReadFile(filepath.Join(s.ProcRoot, base, "stat"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFixture(t, s.ProcRoot, task+"/stat", strings.Replace(string(stat), base+" (", fmt.Sprint(tid)+" (", 1))
+	writeFixture(t, s.ProcRoot, task+"/status", fmt.Sprintf("Tgid:\t%d\nUid:\t%d\t%d\t%d\t%d\n", pid, s.UID, s.UID, s.UID, s.UID))
+	writeFixture(t, s.ProcRoot, task+"/children", "")
+	if tid == pid {
+		if err := os.Symlink("../../fd", filepath.Join(s.ProcRoot, task, "fd")); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		if err := os.MkdirAll(filepath.Join(s.ProcRoot, task, "fd"), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink("../../net", filepath.Join(s.ProcRoot, task, "net")); err != nil {
+		t.Fatal(err)
+	}
+}
+func TestLinuxThreadLocalSocketIsObserved(t *testing.T) {
+	s := procFixture(t)
+	fixtureProcess(t, s, 42)
+	fixtureThread(t, s, 42, 43)
+	writeFixture(t, s.ProcRoot, "42/net/tcp", "header\n 0: 0100007F:1F90 0200007F:C350 01 0:0 0:0 0 0 0 12345\n")
+	fd := filepath.Join(s.ProcRoot, "42/task/43/fd")
+	if err := os.MkdirAll(fd, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("socket:[12345]", filepath.Join(fd, "3")); err != nil {
+		t.Fatal(err)
+	}
+	ps, warnings, err := s.Processes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := ps[42]
+	if !p.SocketsComplete || !p.TelemetryComplete || !p.HasEstablishedConnection() {
+		t.Fatalf("thread socket omitted despite complete telemetry: sockets=%+v warnings=%v", p.Sockets, warnings)
+	}
+}
+
+func TestLinuxSamePathExecReplacementIsRejected(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "helper")
+	first, err := os.ReadFile("/bin/dash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := os.ReadFile("/bin/bash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, first, 0700); err != nil {
+		t.Fatal(err)
+	}
+	script := `read value; exec "$0" -c "$1" "$0" "$1"`
+	cmd := exec.Command(path, "-c", script, path, script)
+	in, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { in.Close(); cmd.Process.Kill(); cmd.Wait() }()
+	s := NewScanner()
+	ps, _, err := s.Processes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := ps[cmd.Process.Pid]
+	pin, err := s.Pin(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pin.Close()
+	exe := filepath.Join("/proc", fmt.Sprint(cmd.Process.Pid), "exe")
+	before, err := os.Stat(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := filepath.Join(root, "replacement")
+	if err := os.WriteFile(replacement, second, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := in.Write([]byte("go\n")); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		after, err := os.Stat(exe)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !os.SameFile(before, after) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("helper did not exec replacement")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := pin.Revalidate(); err == nil {
+		t.Fatal("accepted exec of different executable inode at identical path and argv")
+	}
+	if err := pin.SIGTERM(); err == nil {
+		t.Fatal("signaled replacement executable")
+	}
+}
+
+func TestLinuxThreadSocketGapFailsClosed(t *testing.T) {
+	for _, missing := range []string{"fd", "stat", "status"} {
+		t.Run(missing, func(t *testing.T) {
+			s := procFixture(t)
+			fixtureProcess(t, s, 42)
+			fixtureThread(t, s, 42, 43)
+			if err := os.RemoveAll(filepath.Join(s.ProcRoot, "42/task/43", missing)); err != nil {
+				t.Fatal(err)
+			}
+			ps, warnings, err := s.Processes()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ps[42].SocketsComplete || ps[42].TelemetryComplete || len(warnings) == 0 {
+				t.Fatalf("thread gap accepted: %+v %v", ps[42], warnings)
+			}
+		})
+	}
+}
+
+// mutateDuringFixtureRead replaces a FIFO path after the scanner opens it. The
+// scanner receives the original bytes while later reads see the mutation.
+func mutateDuringFixtureRead(t *testing.T, path string, mutation func() error) <-chan error {
+	t.Helper()
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Mkfifo(path, 0600); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		f, err := os.OpenFile(path, os.O_WRONLY, 0)
+		if err != nil {
+			done <- err
+			return
+		}
+		defer f.Close()
+		if err := os.Remove(path); err != nil {
+			done <- err
+			return
+		}
+		if err := os.WriteFile(path, original, 0600); err != nil {
+			done <- err
+			return
+		}
+		if err := mutation(); err != nil {
+			done <- err
+			return
+		}
+		_, err = f.Write(original)
+		done <- err
+	}()
+	return done
+}
+func TestLinuxSocketSnapshotRejectsThreadChanges(t *testing.T) {
+	for _, change := range []string{"start", "uid", "tgid", "membership", "socket"} {
+		t.Run(change, func(t *testing.T) {
+			s := procFixture(t)
+			fixtureProcess(t, s, 42)
+			fixtureThread(t, s, 42, 43)
+			task := filepath.Join(s.ProcRoot, "42/task/43")
+			stat, err := os.ReadFile(filepath.Join(task, "stat"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			done := mutateDuringFixtureRead(t, filepath.Join(s.ProcRoot, "42/net/tcp"), func() error {
+				switch change {
+				case "start":
+					return os.WriteFile(filepath.Join(task, "stat"), []byte(strings.Replace(string(stat), "1234 4096", "9999 4096", 1)), 0600)
+				case "uid":
+					return os.WriteFile(filepath.Join(task, "status"), []byte(fmt.Sprintf("Tgid: 42\nUid: %d %d %d %d\n", s.UID+1, s.UID+1, s.UID+1, s.UID+1)), 0600)
+				case "tgid":
+					return os.WriteFile(filepath.Join(task, "status"), []byte(fmt.Sprintf("Tgid: 99\nUid: %d %d %d %d\n", s.UID, s.UID, s.UID, s.UID)), 0600)
+				case "membership":
+					return os.RemoveAll(task)
+				case "socket":
+					return os.Symlink("socket:[99999]", filepath.Join(s.ProcRoot, "42/task/42/fd/3"))
+				}
+				return nil
+			})
+			ps, warnings, err := s.Processes()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			if ps[42].SocketsComplete || ps[42].TelemetryComplete || len(warnings) == 0 {
+				t.Fatalf("thread change accepted: %+v %v", ps[42], warnings)
+			}
+		})
+	}
+}
+func TestLinuxExecutableInodeChangeDuringSnapshotFailsClosed(t *testing.T) {
+	s := procFixture(t)
+	fixtureProcess(t, s, 42)
+	replacement := filepath.Join(s.ProcRoot, "replacement-executable")
+	if err := os.WriteFile(replacement, []byte("replacement"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	done := mutateDuringFixtureRead(t, filepath.Join(s.ProcRoot, "42/io"), func() error { return os.Rename(replacement, filepath.Join(s.ProcRoot, "fixture-executable")) })
+	ps, warnings, err := s.Processes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if ps[42].TelemetryComplete || len(warnings) == 0 {
+		t.Fatalf("executable replacement accepted: %+v %v", ps[42], warnings)
+	}
+}
+func TestLinuxSocketFDEnumerationHasAggregateLimit(t *testing.T) {
+	s := procFixture(t)
+	fixtureProcess(t, s, 42)
+	if err := os.Symlink("/dev/null", filepath.Join(s.ProcRoot, "42/fd/3")); err != nil {
+		t.Fatal(err)
+	}
+	budget := 0
+	if _, err := socketInodes(filepath.Join(s.ProcRoot, "42/task/42"), &budget); err == nil {
+		t.Fatal("ignored aggregate FD budget")
 	}
 }

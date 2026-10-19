@@ -78,20 +78,22 @@ type Socket struct {
 }
 
 type Process struct {
-	Key            ProcessKey `json:"key"`
-	PPID           int        `json:"ppid"`
-	PGID           int        `json:"pgid"`
-	SessionID      int        `json:"session_id"`
-	UID            int        `json:"uid"`
-	Name           string     `json:"name"`
-	Executable     string     `json:"executable,omitempty"`
-	Command        string     `json:"command,omitempty"`
-	CommandSummary string     `json:"command_summary"`
-	CommandHash    string     `json:"command_hash"`
-	CWD            string     `json:"cwd,omitempty"`
-	State          string     `json:"state,omitempty"`
-	RSSBytes       uint64     `json:"rss_bytes,omitempty"`
-	CPUTimeMillis  int64      `json:"cpu_time_ms,omitempty"`
+	Key              ProcessKey `json:"key"`
+	PPID             int        `json:"ppid"`
+	PGID             int        `json:"pgid"`
+	SessionID        int        `json:"session_id"`
+	UID              int        `json:"uid"`
+	Name             string     `json:"name"`
+	Executable       string     `json:"executable,omitempty"`
+	ExecutableDevice uint64     `json:"executable_device,omitempty"`
+	ExecutableInode  uint64     `json:"executable_inode,omitempty"`
+	Command          string     `json:"command,omitempty"`
+	CommandSummary   string     `json:"command_summary"`
+	CommandHash      string     `json:"command_hash"`
+	CWD              string     `json:"cwd,omitempty"`
+	State            string     `json:"state,omitempty"`
+	RSSBytes         uint64     `json:"rss_bytes,omitempty"`
+	CPUTimeMillis    int64      `json:"cpu_time_ms,omitempty"`
 	// Linux cumulative disk and syscall I/O counters. Chars include cached and pipe I/O.
 	IOReadBytes  uint64 `json:"io_read_bytes,omitempty"`
 	IOWriteBytes uint64 `json:"io_write_bytes,omitempty"`
