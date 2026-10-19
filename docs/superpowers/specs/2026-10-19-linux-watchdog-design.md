@@ -12,6 +12,8 @@ Automatic cleanup is opt-in in configuration and will be enabled on these two ma
 
 Rescan all sessions and process identities before cleanup. Pin Linux process identities with pidfds and fail closed if unavailable; never fall back to an unguarded numeric PID signal. Validate the full target tree, owner, executable and command identity. Send SIGTERM only and record survivors. Never escalate to SIGKILL automatically. Recheck pins/intentional marks and new descendants immediately before signaling.
 
+The graph covers live processes. If a PID vanishes before its first stat read, omit it only after directory absence and native `pidfd_open` `ESRCH` confirm exit in the same PID namespace as procfs. Unknown visibility, verifier failure and failures after identity was read remain graph gaps. Candidate kernel child membership stays strict.
+
 ## Runtime
 
 Provide `watch`, `watch-once`, and status/report actions, a Herdr dashboard action and startup/event integration that deduplicates watchers. Install a user systemd service so monitoring continues after client disconnects and upgrades. Keep polling, CPU, memory, grace and cooldown values configurable with strict validation. Persist observation continuity but do not count downtime as continuous orphan or resource evidence. Bound state and log retention.

@@ -181,6 +181,45 @@ func readUID(path string) (int, error) {
 	}
 	return -1, errors.New("missing UID")
 }
+
+func samePIDNamespace(status []byte, pid int) bool {
+	for _, line := range strings.Split(string(status), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && fields[0] == "NSpid:" {
+			return len(fields) == 2 && fields[1] == strconv.Itoa(pid)
+		}
+	}
+	return false
+}
+
+func procUsesCallerPIDNamespace() bool {
+	var fs unix.Statfs_t
+	if unix.Statfs("/proc", &fs) != nil || fs.Type != unix.PROC_SUPER_MAGIC {
+		return false
+	}
+	status, err := readBounded("/proc/self/status")
+	return err == nil && samePIDNamespace(status, os.Getpid())
+}
+
+// ESRCH distinguishes a reaped process from hidepid or another visibility gap.
+// Never use this verifier for fixture roots or an ancestor-mounted procfs:
+// pidfd_open interprets PIDs in the caller's PID namespace.
+func confirmedExitedPID(dir string, pid int, open func(int, int) (int, error)) bool {
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+	fd, err := open(pid, 0)
+	if err == nil {
+		_ = unix.Close(fd)
+		return false
+	}
+	if !errors.Is(err, unix.ESRCH) {
+		return false
+	}
+	_, err = os.Stat(dir)
+	return errors.Is(err, os.ErrNotExist)
+}
+
 func (s *Scanner) processesNative() (map[int]model.Process, []string, error) {
 	s.GraphComplete = false
 	boot, started, ticks, err := s.procInfo()
@@ -229,6 +268,11 @@ func (s *Scanner) readProcess(pid int, boot string, bootTime int64, ticks uint64
 
 	statBytes, err := readBounded(filepath.Join(dir, "stat"))
 	if err != nil {
+		// A PID reaped after directory enumeration is not a missing live
+		// ancestor. Keep all other metadata/visibility failures fail-closed.
+		if s.procRoot() == "/proc" && errors.Is(err, os.ErrNotExist) && procUsesCallerPIDNamespace() && confirmedExitedPID(dir, pid, unix.PidfdOpen) {
+			return model.Process{}, true, nil
+		}
 		return model.Process{}, true, errors.Join(errGraphIncomplete, err)
 	}
 	st, err := parseLinuxStat(statBytes)

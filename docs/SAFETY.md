@@ -63,6 +63,15 @@ Incomplete telemetry blocks its containing tree, including unknown or foreign
 kernel children. Shells, agents, service managers, Herdr and intentional trees
 remain protected. PID 1 adoption alone does not protect an attributed helper.
 
+A PID can exit between procfs directory enumeration and its first stat read.
+The scanner omits that PID only when its directory is absent and
+`pidfd_open` confirms `ESRCH`, with procfs verified in the caller's PID
+namespace. A successful pidfd open, unsupported verifier, permission error,
+still-present directory or failure after reading identity remains a gap.
+Fixture roots never consult host pidfds. Candidate child membership remains
+strict, including children absent from the collected map. See
+[pidfd exit semantics](https://man7.org/linux/man-pages/man2/pidfd_open.2.html).
+
 Before signaling, the watchdog refreshes all sessions/processes, pins all
 members, refreshes again, checks pause, and persists an attempt before the
 first signal. It refreshes after those writes, checks pause and intentional

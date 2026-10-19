@@ -160,8 +160,10 @@ block cleanup or authorize deletion.
 Each poll has at most 64 session sockets, 512 panes per session and four socket
 workers. Each request has a two-second deadline; the session phase has a
 20-second deadline. An inaccessible session or incomplete ancestry snapshot
-blocks cleanup and resets orphan continuity. Unrelated process churn can cause
-an ancestry gap; frequent gaps can prevent maturity on a busy host. The
+blocks cleanup and resets orphan continuity. Initial stat absence does not count
+as a live ancestry gap when native pidfd verification confirms exit; permission,
+visibility and later identity-read failures still block cleanup. Frequent
+unresolved gaps can prevent maturity on a busy host. The
 watchdog favors retained helpers over incomplete evidence. A target telemetry
 gap blocks its containing tree without blocking unrelated complete trees.
 
