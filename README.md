@@ -9,10 +9,10 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Efeguclu1/herdr-process-guard/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Efeguclu1/herdr-process-guard/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/Grafton-Apparel/herdr-process-guard/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Grafton-Apparel/herdr-process-guard/actions/workflows/ci.yml/badge.svg"></a>
   <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
   <a href="https://herdr.dev/docs/cli-reference/#plugins"><img alt="Herdr plugin" src="https://img.shields.io/badge/Herdr-plugin-5B21FF.svg"></a>
-  <img alt="Platform: macOS" src="https://img.shields.io/badge/platform-macOS-lightgrey.svg">
+  <img alt="Platform: Linux and macOS" src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey.svg">
 </p>
 
 Coding agents start dev servers, test runners, browser workers, and background
@@ -21,17 +21,20 @@ processes to the exact Herdr workspace, tab, pane, and coding agent; explains
 why they are active or suspected leftovers; and previews the complete process
 tree before anything is stopped.
 
-It is not a generic process cleaner. It is an **agent process inspector and
-lifecycle guard**.
+This Apache-2.0 fork adds a Linux background watchdog to the
+[upstream Process Guard](https://github.com/Efeguclu1/herdr-process-guard).
+The watchdog defaults to notifications. Operators can enable conservative
+cleanup of previously attributed orphan helpers. Live panes and agents stay
+protected, including idle and blocked panes.
 
 ## Install
 
-Requirements: macOS and [Herdr 0.8.0+](https://herdr.dev/). Tagged installs
+Requirements: Linux or macOS and [Herdr 0.9.5+](https://herdr.dev/). Tagged installs
 download a release binary; Go 1.24+ is only required for source development or
 as an installation fallback.
 
 ```sh
-herdr plugin install Efeguclu1/herdr-process-guard --yes
+herdr plugin install Grafton-Apparel/herdr-process-guard --ref v0.2.0 --yes
 herdr plugin pane open --plugin herdr.process-guard --entrypoint dashboard
 ```
 
@@ -44,7 +47,7 @@ herdr plugin action invoke audit --plugin herdr.process-guard
 For local development:
 
 ```sh
-git clone https://github.com/Efeguclu1/herdr-process-guard.git
+git clone https://github.com/Grafton-Apparel/herdr-process-guard.git
 cd herdr-process-guard
 herdr plugin link "$PWD"
 herdr plugin pane open --plugin herdr.process-guard --entrypoint dashboard
@@ -72,7 +75,10 @@ local.
 
 ## Safety model
 
-Process Guard never cleans automatically.
+Manual stop commands keep their typed confirmation. The Linux watchdog has a
+separate opt-in policy: it can send pidfd `SIGTERM` to a previously attributed
+helper after its pane, shell and agent disappear and 30 minutes of observed
+orphanhood and inactivity pass. See [watchdog operation](docs/WATCHDOG.md).
 
 1. Discovery and classification are read-only.
 2. A process needs repeated observations and a mature safety window before it
@@ -129,9 +135,10 @@ tree as intentional.
 
 ## How it works
 
-Process Guard takes short-lived snapshots on Herdr startup and agent/pane
-events. It does not install a daemon. While the dashboard is open it refreshes
-every five seconds.
+The manual inspector refreshes while its dashboard stays open. The optional
+Linux user service polls all local sessions every 30 seconds. Startup and pane
+events ask systemd to start that installed service; they spawn no detached
+workers. The plugin menu opens both dashboards and exposes cleanup pause/resume.
 
 It combines:
 
@@ -141,12 +148,15 @@ It combines:
 - cumulative CPU deltas with a housekeeping threshold
 - recorded agent intervals and previously confirmed listeners
 
-State remains local under `HERDR_PLUGIN_STATE_DIR`. See the
+State remains local under `HERDR_PLUGIN_STATE_DIR`, with manual observation and
+approval files scoped by canonical session socket. The watchdog reads the same
+intentional approvals. See the
 [architecture](docs/ARCHITECTURE.md) for the data flow and trust boundaries.
 
 ## Status
 
-Process Guard is an early macOS-first release. The JSON report format is
+Process Guard supports Linux and macOS; automatic cleanup requires Linux pidfds.
+The JSON report format is
 versioned, but command-line and UI details may evolve before `1.0`.
 
 Contributions are welcome, especially reproducible process-tree fixtures for
@@ -156,3 +166,23 @@ and report security-sensitive findings through [SECURITY.md](SECURITY.md).
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
+
+## Linux watchdog quick start
+
+Run these commands with the release binary or the plugin installed binary:
+
+```sh
+herdr-process-guard watchdog-config
+herdr-process-guard watch-once
+herdr-process-guard service-install
+herdr-process-guard service-start
+herdr-process-guard watchdog-status
+herdr-process-guard pause
+herdr-process-guard resume
+```
+
+`watch-once` observes and reports once; it resets continuity on each invocation.
+The service establishes continuous history. Edit `watchdog-config.json` in the
+state root to set `"cleanup": true` when you want orphan cleanup. The watchdog
+reloads that config on each poll. Read [operation and defaults](docs/WATCHDOG.md)
+before enabling it.

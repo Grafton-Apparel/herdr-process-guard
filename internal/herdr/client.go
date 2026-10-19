@@ -2,6 +2,7 @@ package herdr
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,8 @@ import (
 
 type Client struct {
 	SocketPath string
+	Context    context.Context
+	Timeout    time.Duration
 	sequence   atomic.Uint64
 	Dial       func() (net.Conn, error)
 }
@@ -119,13 +122,28 @@ func (c *Client) call(method string, params any, destination any) error {
 	if c.Dial != nil {
 		connection, err = c.Dial()
 	} else {
-		connection, err = net.DialTimeout("unix", c.SocketPath, 2*time.Second)
+		ctx := c.Context
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		dialer := net.Dialer{Timeout: 2 * time.Second}
+		connection, err = dialer.DialContext(ctx, "unix", c.SocketPath)
 	}
 	if err != nil {
 		return fmt.Errorf("connect to Herdr: %w", err)
 	}
 	defer connection.Close()
-	if err := connection.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+	timeout := c.Timeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	if c.Context != nil {
+		if d, ok := c.Context.Deadline(); ok && d.Before(deadline) {
+			deadline = d
+		}
+	}
+	if err := connection.SetDeadline(deadline); err != nil {
 		return fmt.Errorf("set Herdr request deadline: %w", err)
 	}
 	if err := json.NewEncoder(connection).Encode(request); err != nil {
@@ -167,4 +185,11 @@ func (c *Client) PaneProcessInfo(paneID string) (ProcessInfo, error) {
 		return ProcessInfo{}, err
 	}
 	return result.ProcessInfo, nil
+}
+
+func (c *Client) Notify(title, body string) error {
+	return c.call("notification.show", map[string]any{"title": title, "body": body, "sound": "none"}, nil)
+}
+func (c *Client) OpenDashboard(entrypoint string) error {
+	return c.call("plugin.pane.open", map[string]any{"plugin_id": "herdr.process-guard", "entrypoint": entrypoint, "placement": "popup"}, nil)
 }

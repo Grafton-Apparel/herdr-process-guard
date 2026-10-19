@@ -10,9 +10,13 @@ permissions:
 
 jobs:
   check:
-    name: Test and build
-    runs-on: macos-15
+    name: Test and build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7

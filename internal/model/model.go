@@ -57,11 +57,18 @@ const (
 )
 
 type ProcessKey struct {
-	PID         int   `json:"pid"`
-	StartUnixMS int64 `json:"start_unix_ms"`
+	PID         int    `json:"pid"`
+	BootID      string `json:"boot_id,omitempty"`
+	StartTicks  uint64 `json:"start_ticks,omitempty"`
+	StartUnixMS int64  `json:"start_unix_ms"`
 }
 
-func (k ProcessKey) String() string { return fmt.Sprintf("%d:%d", k.PID, k.StartUnixMS) }
+func (k ProcessKey) String() string {
+	if k.BootID != "" {
+		return fmt.Sprintf("%d:%s:%d", k.PID, k.BootID, k.StartTicks)
+	}
+	return fmt.Sprintf("%d:%d", k.PID, k.StartUnixMS)
+}
 
 type Socket struct {
 	Protocol string `json:"protocol"`
@@ -71,28 +78,40 @@ type Socket struct {
 }
 
 type Process struct {
-	Key              ProcessKey  `json:"key"`
-	PPID             int         `json:"ppid"`
-	PGID             int         `json:"pgid"`
-	SessionID        int         `json:"session_id"`
-	UID              int         `json:"uid"`
-	Name             string      `json:"name"`
-	Executable       string      `json:"executable,omitempty"`
-	Command          string      `json:"command,omitempty"`
-	CommandSummary   string      `json:"command_summary"`
-	CommandHash      string      `json:"command_hash"`
-	CWD              string      `json:"cwd,omitempty"`
-	State            string      `json:"state,omitempty"`
-	RSSBytes         uint64      `json:"rss_bytes,omitempty"`
-	CPUTimeMillis    int64       `json:"cpu_time_ms,omitempty"`
-	Sockets          []Socket    `json:"sockets,omitempty"`
-	Children         []int       `json:"children,omitempty"`
-	RecordedParent   *ProcessKey `json:"recorded_parent,omitempty"`
-	Detached         bool        `json:"detached,omitempty"`
-	RecordedListener bool        `json:"recorded_listener,omitempty"`
-	Infrastructure   bool        `json:"infrastructure,omitempty"`
-	Protected        bool        `json:"protected,omitempty"`
-	ProtectionReason string      `json:"protection_reason,omitempty"`
+	Key              ProcessKey `json:"key"`
+	PPID             int        `json:"ppid"`
+	PGID             int        `json:"pgid"`
+	SessionID        int        `json:"session_id"`
+	UID              int        `json:"uid"`
+	Name             string     `json:"name"`
+	Executable       string     `json:"executable,omitempty"`
+	ExecutableDevice uint64     `json:"executable_device,omitempty"`
+	ExecutableInode  uint64     `json:"executable_inode,omitempty"`
+	Command          string     `json:"command,omitempty"`
+	CommandSummary   string     `json:"command_summary"`
+	CommandHash      string     `json:"command_hash"`
+	CWD              string     `json:"cwd,omitempty"`
+	State            string     `json:"state,omitempty"`
+	RSSBytes         uint64     `json:"rss_bytes,omitempty"`
+	CPUTimeMillis    int64      `json:"cpu_time_ms,omitempty"`
+	// Linux cumulative disk and syscall I/O counters. Chars include cached and pipe I/O.
+	IOReadBytes  uint64 `json:"io_read_bytes,omitempty"`
+	IOWriteBytes uint64 `json:"io_write_bytes,omitempty"`
+	IOReadChars  uint64 `json:"io_read_chars,omitempty"`
+	IOWriteChars uint64 `json:"io_write_chars,omitempty"`
+	// Automatic cleanup requires these flags for each target and a complete ancestry graph.
+	TelemetryComplete bool        `json:"telemetry_complete"`
+	ChildrenComplete  bool        `json:"children_complete"`
+	SocketsComplete   bool        `json:"sockets_complete"`
+	IOComplete        bool        `json:"io_complete"`
+	Sockets           []Socket    `json:"sockets,omitempty"`
+	Children          []int       `json:"children,omitempty"`
+	RecordedParent    *ProcessKey `json:"recorded_parent,omitempty"`
+	Detached          bool        `json:"detached,omitempty"`
+	RecordedListener  bool        `json:"recorded_listener,omitempty"`
+	Infrastructure    bool        `json:"infrastructure,omitempty"`
+	Protected         bool        `json:"protected,omitempty"`
+	ProtectionReason  string      `json:"protection_reason,omitempty"`
 }
 
 func (p Process) HasListener() bool {

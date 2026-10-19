@@ -50,3 +50,48 @@ func TestClientReadsSnapshotAndProcessInfo(t *testing.T) {
 	<-done
 	<-done
 }
+
+func TestNotificationWireMethodAndSilentSound(t *testing.T) {
+	done := make(chan map[string]any, 1)
+	c := &Client{Dial: func() (net.Conn, error) {
+		client, server := net.Pipe()
+		go func() {
+			defer server.Close()
+			var req map[string]any
+			_ = json.NewDecoder(server).Decode(&req)
+			done <- req
+			_ = json.NewEncoder(server).Encode(map[string]any{"id": req["id"], "result": map[string]any{}})
+		}()
+		return client, nil
+	}}
+	if err := c.Notify("title", "body"); err != nil {
+		t.Fatal(err)
+	}
+	r := <-done
+	p := r["params"].(map[string]any)
+	if r["method"] != "notification.show" || p["title"] != "title" || p["body"] != "body" || p["sound"] != "none" {
+		t.Fatalf("wrong RPC: %+v", r)
+	}
+}
+func TestOpenDashboardUsesPluginPane(t *testing.T) {
+	done := make(chan map[string]any, 1)
+	c := &Client{Dial: func() (net.Conn, error) {
+		a, b := net.Pipe()
+		go func() {
+			defer b.Close()
+			var req map[string]any
+			_ = json.NewDecoder(b).Decode(&req)
+			done <- req
+			_ = json.NewEncoder(b).Encode(map[string]any{"id": req["id"], "result": map[string]any{}})
+		}()
+		return a, nil
+	}}
+	if err := c.OpenDashboard("watchdog-status"); err != nil {
+		t.Fatal(err)
+	}
+	r := <-done
+	p := r["params"].(map[string]any)
+	if r["method"] != "plugin.pane.open" || p["entrypoint"] != "watchdog-status" || p["placement"] != "popup" || p["plugin_id"] != "herdr.process-guard" {
+		t.Fatal(r)
+	}
+}

@@ -6,7 +6,8 @@ version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$plugin_root/herdr-plugin.toml
 
 case "$(uname -s)" in
   Darwin) platform=darwin ;;
-  *) echo "Process Guard currently supports macOS only." >&2; exit 1 ;;
+  Linux) platform=linux ;;
+  *) echo "Process Guard supports Linux and macOS." >&2; exit 1 ;;
 esac
 
 case "$(uname -m)" in
@@ -17,7 +18,7 @@ esac
 
 mkdir -p "$plugin_root/bin"
 archive="herdr-process-guard_${version}_${platform}_${architecture}"
-url="https://github.com/Efeguclu1/herdr-process-guard/releases/download/v${version}/${archive}.tar.gz"
+url="https://github.com/Grafton-Apparel/herdr-process-guard/releases/download/v${version}/${archive}.tar.gz"
 checksum_url="$url.sha256"
 temporary_directory=$(mktemp -d "${TMPDIR:-/tmp}/herdr-process-guard.XXXXXX")
 trap 'rm -rf "$temporary_directory"' EXIT HUP INT TERM
@@ -25,7 +26,15 @@ trap 'rm -rf "$temporary_directory"' EXIT HUP INT TERM
 if command -v curl >/dev/null 2>&1 \
   && curl -fsSL "$url" -o "$temporary_directory/$archive.tar.gz" \
   && curl -fsSL "$checksum_url" -o "$temporary_directory/$archive.tar.gz.sha256"; then
-  if ! (cd "$temporary_directory" && shasum -a 256 -c "$archive.tar.gz.sha256"); then
+  if command -v sha256sum >/dev/null 2>&1; then
+    checksum_command="sha256sum"
+  elif command -v shasum >/dev/null 2>&1; then
+    checksum_command="shasum -a 256"
+  else
+    echo "Install sha256sum or shasum to verify Process Guard releases." >&2
+    exit 1
+  fi
+  if ! (cd "$temporary_directory" && $checksum_command -c "$archive.tar.gz.sha256"); then
     echo "Process Guard release checksum verification failed." >&2
     exit 1
   fi

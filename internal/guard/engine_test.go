@@ -1,10 +1,20 @@
 package guard
 
 import (
+	"bufio"
+	"encoding/json"
+	"net"
+	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
+	"github.com/Efeguclu1/herdr-process-guard/internal/herdr"
 	"github.com/Efeguclu1/herdr-process-guard/internal/model"
+	"github.com/Efeguclu1/herdr-process-guard/internal/platform"
+	"github.com/Efeguclu1/herdr-process-guard/internal/store"
+	"github.com/Efeguclu1/herdr-process-guard/internal/watchdog"
 )
 
 func fixtureProcess(pid, ppid int, started time.Time, command string) model.Process {
@@ -218,5 +228,215 @@ func TestRecordedListenerKeepsKnownWorkloadStableWhenSocketTelemetryMisses(t *te
 	annotateRecordedLineage(processes, state, "w1:p1", process.SessionID)
 	if !processes[30].RecordedListener || !looksLikeWorkload(processes[30], now) {
 		t.Fatalf("known listener should remain a workload during a telemetry miss: %+v", processes[30])
+	}
+}
+
+func TestInspectorPruningPreservesExactMarkedSurvivorsForWatchdog(t *testing.T) {
+	for _, scenario := range []string{"root-live", "root-gone", "root-reused", "child-reused", "all-gone", "both-reused"} {
+		t.Run(scenario, func(t *testing.T) {
+			t.Setenv("HERDR_PLUGIN_STATE_DIR", t.TempDir())
+			now := time.Unix(10000, 0)
+			root := fixtureProcess(30, 1, now.Add(-time.Hour), "root")
+			child := fixtureProcess(40, 30, now.Add(-time.Hour), "child")
+			socket := "/fixture/marked-session/herdr.sock"
+			dir, err := store.SessionDirectory(socket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			registry := store.New(dir)
+			approval := model.Approval{Root: root.Key, Members: []model.ProcessKey{root.Key, child.Key}, MarkedAt: now}
+			if _, err := registry.Update(func(state *model.PersistedState) error { state.Approvals[root.Key.String()] = approval; return nil }); err != nil {
+				t.Fatal(err)
+			}
+			live := map[int]model.Process{child.Key.PID: child}
+			wantKeep := true
+			switch scenario {
+			case "root-live":
+				live[root.Key.PID] = root
+			case "root-reused":
+				replacement := root
+				replacement.Key.StartUnixMS++
+				live[root.Key.PID] = replacement
+			case "child-reused":
+				replacement := child
+				replacement.Key.StartUnixMS++
+				live[child.Key.PID] = replacement
+				wantKeep = false
+			case "all-gone":
+				delete(live, child.Key.PID)
+				wantKeep = false
+			case "both-reused":
+				replacement := root
+				replacement.Key.StartUnixMS++
+				live[root.Key.PID] = replacement
+				replacement = child
+				replacement.Key.StartUnixMS++
+				live[child.Key.PID] = replacement
+				wantKeep = false
+			}
+			collector := watchdog.Collector{Paths: func() ([]string, []string, error) { return nil, nil, nil }, KnownSockets: func() ([]string, error) { return []string{socket}, nil }, Processes: func() (map[int]model.Process, []string, bool, error) { return live, nil, true, nil }}
+			before, err := collector.Snapshot()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := registry.Update(func(state *model.PersistedState) error {
+				pruneState(state, live, now, DefaultConfig(), true)
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			saved, err := registry.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			kept, ok := saved.Approvals[root.Key.String()]
+			if ok != wantKeep {
+				t.Fatalf("approval retained=%v want %v", ok, wantKeep)
+			}
+			if wantKeep && (kept.Root != root.Key || len(kept.Members) != 2 || kept.Members[1] != child.Key) {
+				t.Fatal("pruning changed approved identities")
+			}
+			after, err := collector.Snapshot()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if wantKeep && !after.Intentional[child.Key.String()] {
+				t.Fatal("inspector refresh removed surviving exact member protection")
+			}
+			for _, p := range live {
+				if p.Key != root.Key && p.Key != child.Key && after.Intentional[p.Key.String()] {
+					t.Fatal("approval transferred to reused PID")
+				}
+			}
+			if !wantKeep && len(after.Intentional) != 0 {
+				t.Fatal("dead/reused identities kept current process protection")
+			}
+			if wantKeep && !before.Intentional[child.Key.String()] {
+				t.Fatal("fixture had no initial member protection")
+			}
+		})
+	}
+}
+
+func TestScanRetainsApprovalsWhenGraphCompletenessUnknown(t *testing.T) {
+	for _, kind := range []string{"native-missing-stat", "legacy-unknown"} {
+		t.Run(kind, func(t *testing.T) {
+			if kind == "native-missing-stat" && runtime.GOOS != "linux" {
+				t.Skip("native procfs fixture requires Linux")
+			}
+			now := time.Unix(1800000000, 0)
+			config := DefaultConfig()
+			registry := store.New(t.TempDir())
+			key := model.ProcessKey{PID: 42, BootID: "fixture-boot", StartTicks: 1234, StartUnixMS: 1700000012340}
+			member := model.ProcessKey{PID: 43, BootID: "fixture-boot", StartTicks: 1250, StartUnixMS: 1700000012500}
+			approval := model.Approval{Root: key, Members: []model.ProcessKey{key, member}, MarkedAt: now.Add(-time.Hour)}
+			_, err := registry.Update(func(state *model.PersistedState) error {
+				state.Approvals[key.String()] = approval
+				state.Observations["stale"] = model.Observation{LastObservedAt: now.Add(-2 * config.HistoryRetention)}
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			scanner := &platform.Scanner{UID: os.Getuid(), Run: func(string, ...string) ([]byte, error) { return nil, nil }}
+			if kind == "native-missing-stat" {
+				procRoot := t.TempDir()
+				if err := os.MkdirAll(filepath.Join(procRoot, "sys/kernel/random"), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(procRoot, "stat"), []byte("btime 1700000000\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(procRoot, "sys/kernel/random/boot_id"), []byte("fixture-boot\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(filepath.Join(procRoot, "42"), 0700); err != nil {
+					t.Fatal(err)
+				}
+				scanner = &platform.Scanner{UID: os.Getuid(), ProcRoot: procRoot, ClockTicks: 100}
+			}
+			client := &herdr.Client{Dial: func() (net.Conn, error) {
+				local, remote := net.Pipe()
+				go func() {
+					defer remote.Close()
+					var request map[string]any
+					_ = json.NewDecoder(bufio.NewReader(remote)).Decode(&request)
+					_ = json.NewEncoder(remote).Encode(map[string]any{"id": request["id"], "result": map[string]any{"snapshot": map[string]any{"panes": []any{}}}})
+				}()
+				return local, nil
+			}}
+			engine := &Engine{Herdr: client, Scanner: scanner, Store: registry, Config: config, Now: func() time.Time { return now }}
+			if _, err := engine.Scan("approval-gap-fixture"); err != nil {
+				t.Fatal(err)
+			}
+			if scanner.GraphComplete {
+				t.Fatal("fixture did not produce unknown graph completeness")
+			}
+			saved, err := registry.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			retained, ok := saved.Approvals[key.String()]
+			if !ok || retained.Root != key || len(retained.Members) != 2 || retained.Members[1] != member {
+				t.Fatal("unknown graph removed or changed exact intentional identities")
+			}
+			if len(saved.Observations) != 0 {
+				t.Fatal("approval retention skipped unrelated history maintenance")
+			}
+		})
+	}
+}
+
+func TestUnknownGraphRetentionDoesNotTransferApprovalToReusedPIDs(t *testing.T) {
+	t.Setenv("HERDR_PLUGIN_STATE_DIR", t.TempDir())
+	now := time.Unix(1800000000, 0)
+	root := fixtureProcess(30, 1, now.Add(-time.Hour), "marked root")
+	child := fixtureProcess(40, 30, now.Add(-time.Hour), "marked member")
+	replacementRoot := root
+	replacementRoot.Key.StartUnixMS++
+	replacementChild := child
+	replacementChild.Key.StartUnixMS++
+	live := map[int]model.Process{30: replacementRoot, 40: replacementChild}
+	socket := "/fixture/incomplete-session/herdr.sock"
+	dir, err := store.SessionDirectory(socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := store.New(dir)
+	if _, err := registry.Update(func(state *model.PersistedState) error {
+		state.Approvals[root.Key.String()] = model.Approval{Root: root.Key, Members: []model.ProcessKey{root.Key, child.Key}, MarkedAt: now}
+		pruneState(state, live, now, DefaultConfig(), false)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := registry.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	approval, ok := saved.Approvals[root.Key.String()]
+	if !ok || approval.Root != root.Key || len(approval.Members) != 2 || approval.Members[1] != child.Key {
+		t.Fatal("unknown graph changed retained exact identities")
+	}
+	collector := watchdog.Collector{Paths: func() ([]string, []string, error) { return nil, nil, nil }, KnownSockets: func() ([]string, error) { return []string{socket}, nil }, Processes: func() (map[int]model.Process, []string, bool, error) { return live, nil, true, nil }}
+	snapshot, err := collector.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Intentional) != 0 {
+		t.Fatal("retained approval transferred to reused process identities")
+	}
+	if _, err := registry.Update(func(state *model.PersistedState) error {
+		pruneState(state, live, now, DefaultConfig(), true)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	saved, err = registry.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(saved.Approvals) != 0 {
+		t.Fatal("complete graph did not expire exited identities")
 	}
 }

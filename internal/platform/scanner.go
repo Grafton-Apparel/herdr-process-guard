@@ -7,13 +7,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/Efeguclu1/herdr-process-guard/internal/model"
+	"golang.org/x/sys/unix"
 )
 
 type Runner func(name string, args ...string) ([]byte, error)
@@ -21,10 +22,20 @@ type Runner func(name string, args ...string) ([]byte, error)
 type Scanner struct {
 	Run Runner
 	UID int
+	// ProcRoot and ClockTicks permit procfs fixtures; leave unset for live collection.
+	ProcRoot   string
+	ClockTicks uint64
+	// GraphComplete describes ancestry enumeration from the last native snapshot.
+	// Per-process metadata warnings do not imply a graph gap. Read after Processes.
+	GraphComplete bool
 }
 
 func NewScanner() *Scanner {
-	return &Scanner{Run: runCommand, UID: os.Getuid()}
+	s := &Scanner{UID: os.Getuid()}
+	if runtime.GOOS != "linux" {
+		s.Run = runCommand
+	}
+	return s
 }
 
 func runCommand(name string, args ...string) ([]byte, error) {
@@ -34,6 +45,9 @@ func runCommand(name string, args ...string) ([]byte, error) {
 }
 
 func (s *Scanner) Processes() (map[int]model.Process, []string, error) {
+	if s.Run == nil {
+		return s.processesNative()
+	}
 	output, err := s.Run("/bin/ps", "-ww", "-axo", "pid=,ppid=,pgid=,sess=,uid=,lstart=,state=,rss=,time=,comm=,args=")
 	if err != nil {
 		return nil, nil, fmt.Errorf("list processes: %w", err)
@@ -48,7 +62,7 @@ func (s *Scanner) Processes() (map[int]model.Process, []string, error) {
 		}
 		// macOS `ps` exposes a `sess` display field that is not the numeric
 		// session id returned by getsid(2). Herdr uses the latter to own panes.
-		if sessionID, sessionErr := syscall.Getsid(process.Key.PID); sessionErr == nil {
+		if sessionID, sessionErr := unix.Getsid(process.Key.PID); sessionErr == nil {
 			process.SessionID = sessionID
 		}
 		processes[process.Key.PID] = process

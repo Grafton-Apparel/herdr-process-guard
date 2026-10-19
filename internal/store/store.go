@@ -1,6 +1,7 @@
 package store
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,11 +22,16 @@ func DefaultDirectory() (string, error) {
 	if path := os.Getenv("HERDR_PLUGIN_STATE_DIR"); path != "" {
 		return path, nil
 	}
-	config, err := os.UserConfigDir()
-	if err != nil {
-		return "", err
+	// Herdr 0.9.5 uses config::state_dir(), including on macOS.
+	root := os.Getenv("XDG_STATE_HOME")
+	if root == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		root = filepath.Join(home, ".local", "state")
 	}
-	return filepath.Join(config, "herdr", "plugins", "herdr.process-guard", "state"), nil
+	return filepath.Join(root, "herdr", "plugins", "herdr.process-guard"), nil
 }
 
 func New(directory string) *Store { return &Store{Directory: directory} }
@@ -128,4 +134,35 @@ func (s *Store) saveUnlocked(state model.PersistedState) error {
 		return fmt.Errorf("replace state: %w", err)
 	}
 	return nil
+}
+
+// CanonicalSocket makes plugin and service callers use the same socket namespace.
+func CanonicalSocket(socket string) (string, error) {
+	path, err := filepath.Abs(socket)
+	if err != nil {
+		return "", err
+	}
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved, nil
+	}
+	// A stopped socket has no inode. Resolve its parent when possible.
+	if parent, err := filepath.EvalSymlinks(filepath.Dir(path)); err == nil {
+		return filepath.Join(parent, filepath.Base(path)), nil
+	}
+	return filepath.Clean(path), nil
+}
+func SessionDirectory(socket string) (string, error) {
+	if socket == "" {
+		return "", errors.New("session socket is required")
+	}
+	root, err := DefaultDirectory()
+	if err != nil {
+		return "", err
+	}
+	path, err := CanonicalSocket(socket)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256([]byte(path))
+	return filepath.Join(root, "sessions", fmt.Sprintf("%x", sum[:16])), nil
 }

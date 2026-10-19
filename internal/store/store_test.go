@@ -3,6 +3,7 @@ package store
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -54,5 +55,54 @@ func TestRejectsUnknownSchema(t *testing.T) {
 	}
 	if _, err := storage.Load(); err == nil {
 		t.Fatal("expected unsupported schema error")
+	}
+}
+
+func TestSessionDirectoryIsSharedAndSocketScoped(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HERDR_PLUGIN_STATE_DIR", root)
+	a, err := SessionDirectory("/tmp/herdr-a.sock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := SessionDirectory("/tmp/herdr-b.sock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := SessionDirectory("/tmp/./herdr-a.sock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a == b || a != again || !strings.HasPrefix(a, root+"/") {
+		t.Fatalf("namespace %q %q %q", a, b, again)
+	}
+}
+
+func TestDefaultDirectoryMatchesHerdr095StateNamespace(t *testing.T) {
+	t.Setenv("HERDR_PLUGIN_STATE_DIR", "")
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	want := filepath.Join(os.Getenv("XDG_STATE_HOME"), "herdr", "plugins", "herdr.process-guard")
+	got, err := DefaultDirectory()
+	if err != nil || got != want {
+		t.Fatalf("XDG state root: %q want %q (%v)", got, want, err)
+	}
+	t.Setenv("HERDR_PLUGIN_STATE_DIR", want)
+	plugin, err := DefaultDirectory()
+	if err != nil || plugin != got {
+		t.Fatal("plugin and service namespace differs", plugin, got, err)
+	}
+	t.Setenv("HERDR_PLUGIN_STATE_DIR", "")
+	t.Setenv("XDG_STATE_HOME", "")
+	t.Setenv("HOME", t.TempDir())
+	want = filepath.Join(os.Getenv("HOME"), ".local", "state", "herdr", "plugins", "herdr.process-guard")
+	got, err = DefaultDirectory()
+	if err != nil || got != want {
+		t.Fatalf("HOME state root: %q want %q (%v)", got, want, err)
+	}
+	override := t.TempDir()
+	t.Setenv("HERDR_PLUGIN_STATE_DIR", override)
+	got, err = DefaultDirectory()
+	if err != nil || got != override {
+		t.Fatal("explicit plugin override ignored", got, err)
 	}
 }
