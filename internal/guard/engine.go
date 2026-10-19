@@ -64,7 +64,7 @@ func (e *Engine) Scan(reason string) (model.Report, error) {
 	updated, err := e.Store.Update(func(state *model.PersistedState) error {
 		updateAgentIntervals(state, contexts, now)
 		updateObservations(state, trees, now)
-		pruneState(state, processes, now, e.Config)
+		pruneState(state, processes, now, e.Config, e.Scanner.GraphComplete)
 		return nil
 	})
 	if err != nil {
@@ -731,28 +731,32 @@ func markDuplicateServices(trees []model.Tree) {
 	}
 }
 
-func pruneState(state *model.PersistedState, live map[int]model.Process, now time.Time, config Config) {
+func pruneState(state *model.PersistedState, live map[int]model.Process, now time.Time, config Config, graphComplete bool) {
 	cutoff := now.Add(-config.HistoryRetention)
 	for key, observation := range state.Observations {
 		if observation.LastObservedAt.Before(cutoff) {
 			delete(state.Observations, key)
 		}
 	}
-	for key, approval := range state.Approvals {
-		root, ok := live[approval.Root.PID]
-		retained := ok && root.Key == approval.Root
-		if !retained {
-			for _, member := range approval.Members {
-				if process, ok := live[member.PID]; ok && process.Key == member {
-					retained = true
-					break
+	// Omitted identities in an incomplete graph are unknown, not proven exits.
+	// Keep exact approval keys until a complete snapshot can establish expiry.
+	if graphComplete {
+		for key, approval := range state.Approvals {
+			root, ok := live[approval.Root.PID]
+			retained := ok && root.Key == approval.Root
+			if !retained {
+				for _, member := range approval.Members {
+					if process, ok := live[member.PID]; ok && process.Key == member {
+						retained = true
+						break
+					}
 				}
 			}
-		}
-		// The watchdog protects exact marked members after their root exits.
-		// Keep the original keys; a reused PID must not acquire that protection.
-		if !retained {
-			delete(state.Approvals, key)
+			// The watchdog protects exact marked members after their root exits.
+			// Keep the original keys; a reused PID must not acquire that protection.
+			if !retained {
+				delete(state.Approvals, key)
+			}
 		}
 	}
 	for key, attempt := range state.TerminationAttempts {
