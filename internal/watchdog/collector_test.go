@@ -6,13 +6,26 @@ import (
 	"github.com/Efeguclu1/herdr-process-guard/internal/model"
 	"github.com/Efeguclu1/herdr-process-guard/internal/store"
 	"net"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
 func socketFixture(t *testing.T, malformed bool) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "herdr.sock")
+	// Darwin Unix sockets have a 104-byte sun_path limit. Long TMPDIR roots
+	// and nested test names can exceed it, so give sockets a short unique root.
+	directory, err := os.MkdirTemp("/tmp", "hpg-sock-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(directory); err != nil {
+			t.Errorf("remove socket fixture: %v", err)
+		}
+	})
+	path := filepath.Join(directory, "herdr.sock")
 	listener, err := net.Listen("unix", path)
 	if err != nil {
 		t.Fatal(err)
@@ -92,5 +105,30 @@ func TestCollectorMalformedSnapshotAndUnknownShellBlock(t *testing.T) {
 	}
 	if s.Complete {
 		t.Fatal("missing shell accepted")
+	}
+}
+
+func TestSocketFixtureUsesShortUniquePathsAndCleansUp(t *testing.T) {
+	longTemp := filepath.Join(t.TempDir(), strings.Repeat("long-parent-", 10))
+	if err := os.MkdirAll(longTemp, 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMPDIR", longTemp)
+	var paths []string
+	t.Run("fixtures", func(t *testing.T) {
+		paths = []string{socketFixture(t, false), socketFixture(t, false)}
+		if paths[0] == paths[1] {
+			t.Fatal("socket fixtures share a path")
+		}
+		for _, path := range paths {
+			if len(path) >= 104 {
+				t.Fatalf("socket path exceeds Darwin sun_path capacity: %d bytes", len(path))
+			}
+		}
+	})
+	for _, path := range paths {
+		if _, err := os.Stat(filepath.Dir(path)); !os.IsNotExist(err) {
+			t.Fatalf("socket fixture directory survived cleanup: %v", err)
+		}
 	}
 }
