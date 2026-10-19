@@ -740,7 +740,18 @@ func pruneState(state *model.PersistedState, live map[int]model.Process, now tim
 	}
 	for key, approval := range state.Approvals {
 		root, ok := live[approval.Root.PID]
-		if !ok || root.Key != approval.Root {
+		retained := ok && root.Key == approval.Root
+		if !retained {
+			for _, member := range approval.Members {
+				if process, ok := live[member.PID]; ok && process.Key == member {
+					retained = true
+					break
+				}
+			}
+		}
+		// The watchdog protects exact marked members after their root exits.
+		// Keep the original keys; a reused PID must not acquire that protection.
+		if !retained {
 			delete(state.Approvals, key)
 		}
 	}

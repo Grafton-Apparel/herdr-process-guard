@@ -144,6 +144,18 @@ func (r *Runner) invalidate(st *State, snapshot Snapshot, want Candidate, reason
 	}
 	return reason
 }
+
+// A pin can discover a telemetry/identity gap after an otherwise healthy snapshot.
+// A fresh snapshot establishes whether continuity breaks globally or for this tree.
+func (r *Runner) invalidatePin(st *State, want Candidate, reason error) error {
+	snapshot, err := r.Source()
+	if err != nil {
+		snapshot = Snapshot{}
+		reason = fmt.Errorf("%w; resnapshot after pin failure: %v", reason, err)
+	}
+	return r.invalidate(st, snapshot, want, reason)
+}
+
 func (r *Runner) cleanup(st *State, want Candidate) error {
 	if _, err := r.validate(st, want, false); err != nil {
 		return err
@@ -157,7 +169,7 @@ func (r *Runner) cleanup(st *State, want Candidate) error {
 	for _, p := range want.Members {
 		pin, err := r.Pin(p)
 		if err != nil {
-			return err
+			return r.invalidatePin(st, want, err)
 		}
 		pins = append(pins, pin)
 	}
@@ -198,7 +210,7 @@ func (r *Runner) cleanup(st *State, want Candidate) error {
 	}
 	for _, p := range pins {
 		if err = p.Revalidate(); err != nil {
-			return err
+			return r.invalidatePin(st, want, err)
 		}
 	}
 	if r.Context != nil && r.Context.Err() != nil {

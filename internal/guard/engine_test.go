@@ -5,6 +5,8 @@ import (
 	"time"
 
 	"github.com/Efeguclu1/herdr-process-guard/internal/model"
+	"github.com/Efeguclu1/herdr-process-guard/internal/store"
+	"github.com/Efeguclu1/herdr-process-guard/internal/watchdog"
 )
 
 func fixtureProcess(pid, ppid int, started time.Time, command string) model.Process {
@@ -218,5 +220,89 @@ func TestRecordedListenerKeepsKnownWorkloadStableWhenSocketTelemetryMisses(t *te
 	annotateRecordedLineage(processes, state, "w1:p1", process.SessionID)
 	if !processes[30].RecordedListener || !looksLikeWorkload(processes[30], now) {
 		t.Fatalf("known listener should remain a workload during a telemetry miss: %+v", processes[30])
+	}
+}
+
+func TestInspectorPruningPreservesExactMarkedSurvivorsForWatchdog(t *testing.T) {
+	for _, scenario := range []string{"root-live", "root-gone", "root-reused", "child-reused", "all-gone", "both-reused"} {
+		t.Run(scenario, func(t *testing.T) {
+			t.Setenv("HERDR_PLUGIN_STATE_DIR", t.TempDir())
+			now := time.Unix(10000, 0)
+			root := fixtureProcess(30, 1, now.Add(-time.Hour), "root")
+			child := fixtureProcess(40, 30, now.Add(-time.Hour), "child")
+			socket := "/fixture/marked-session/herdr.sock"
+			dir, err := store.SessionDirectory(socket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			registry := store.New(dir)
+			approval := model.Approval{Root: root.Key, Members: []model.ProcessKey{root.Key, child.Key}, MarkedAt: now}
+			if _, err := registry.Update(func(state *model.PersistedState) error { state.Approvals[root.Key.String()] = approval; return nil }); err != nil {
+				t.Fatal(err)
+			}
+			live := map[int]model.Process{child.Key.PID: child}
+			wantKeep := true
+			switch scenario {
+			case "root-live":
+				live[root.Key.PID] = root
+			case "root-reused":
+				replacement := root
+				replacement.Key.StartUnixMS++
+				live[root.Key.PID] = replacement
+			case "child-reused":
+				replacement := child
+				replacement.Key.StartUnixMS++
+				live[child.Key.PID] = replacement
+				wantKeep = false
+			case "all-gone":
+				delete(live, child.Key.PID)
+				wantKeep = false
+			case "both-reused":
+				replacement := root
+				replacement.Key.StartUnixMS++
+				live[root.Key.PID] = replacement
+				replacement = child
+				replacement.Key.StartUnixMS++
+				live[child.Key.PID] = replacement
+				wantKeep = false
+			}
+			collector := watchdog.Collector{Paths: func() ([]string, []string, error) { return nil, nil, nil }, KnownSockets: func() ([]string, error) { return []string{socket}, nil }, Processes: func() (map[int]model.Process, []string, bool, error) { return live, nil, true, nil }}
+			before, err := collector.Snapshot()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := registry.Update(func(state *model.PersistedState) error { pruneState(state, live, now, DefaultConfig()); return nil }); err != nil {
+				t.Fatal(err)
+			}
+			saved, err := registry.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			kept, ok := saved.Approvals[root.Key.String()]
+			if ok != wantKeep {
+				t.Fatalf("approval retained=%v want %v", ok, wantKeep)
+			}
+			if wantKeep && (kept.Root != root.Key || len(kept.Members) != 2 || kept.Members[1] != child.Key) {
+				t.Fatal("pruning changed approved identities")
+			}
+			after, err := collector.Snapshot()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if wantKeep && !after.Intentional[child.Key.String()] {
+				t.Fatal("inspector refresh removed surviving exact member protection")
+			}
+			for _, p := range live {
+				if p.Key != root.Key && p.Key != child.Key && after.Intentional[p.Key.String()] {
+					t.Fatal("approval transferred to reused PID")
+				}
+			}
+			if !wantKeep && len(after.Intentional) != 0 {
+				t.Fatal("dead/reused identities kept current process protection")
+			}
+			if wantKeep && !before.Intentional[child.Key.String()] {
+				t.Fatal("fixture had no initial member protection")
+			}
+		})
 	}
 }

@@ -460,3 +460,134 @@ func TestFinalPreflightGapKeepsDurableAttemptAndResetsContinuity(t *testing.T) {
 		t.Fatal("final gap lost suppression/continuity or allowed signaling")
 	}
 }
+
+func TestPinFailureRestartsWindowBeforeNextPoll(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("positive cleanup fixture requires Linux")
+	}
+	st, s, now := observeMature(t, nil, false)
+	now = now.Add(Defaults().Poll())
+	cfg := Defaults()
+	cfg.Cleanup = true
+	pins, signals, closed := 0, 0, 0
+	r := Runner{Config: cfg, Repo: Repository{Directory: t.TempDir()}, Now: func() time.Time { return now }, Source: func() (Snapshot, error) { return s, nil }, Pin: func(model.Process) (Pin, error) {
+		pins++
+		if pins == 1 {
+			return nil, errors.New("pinned process socket telemetry unavailable")
+		}
+		return &fakePin{signals: &signals, closed: &closed}, nil
+	}, Sleep: func(time.Duration) {}}
+	if err := r.Repo.Save(st); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Once(&st); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := r.Repo.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := s.Processes[30].Key.String()
+	if !saved.Records[key].OrphanSince.IsZero() || !saved.Records[key].QuietSince.IsZero() {
+		t.Fatal("pin failure did not persist continuity reset")
+	}
+	now = now.Add(cfg.Poll())
+	if err := r.Once(&st); err != nil {
+		t.Fatal(err)
+	}
+	if signals != 0 || pins != 1 {
+		t.Fatalf("pin telemetry gap permitted next-poll retry: %d pins, %d signals", pins, signals)
+	}
+	if !st.Records[key].OrphanSince.Equal(now) || !st.Records[key].QuietSince.Equal(now) {
+		t.Fatal("pin failure did not require a fresh complete interval")
+	}
+}
+
+func TestPinFailureResnapshotPreservesInvalidationScope(t *testing.T) {
+	for _, failure := range []string{"target", "session", "graph", "source-error"} {
+		t.Run(failure, func(t *testing.T) {
+			st, s, now := observeMature(t, nil, false)
+			other := proc(40, 1, "other-helper")
+			s.Processes[40] = other
+			key := s.Processes[30].Key.String()
+			otherKey := other.Key.String()
+			record := st.Records[key]
+			record.Last = other
+			record.Socket = "/other"
+			record.Pane = "other-pane"
+			st.Records[otherKey] = record
+			st.Attempts[otherKey] = true
+			want := Candidates(st, s, now, Defaults())[0]
+			resourceCount := len(st.Resources)
+			calls := 0
+			r := Runner{Config: Defaults(), Repo: Repository{Directory: t.TempDir()}, Now: func() time.Time { return now }, Source: func() (Snapshot, error) {
+				calls++
+				fresh := s
+				switch failure {
+				case "session":
+					fresh.Complete = false
+				case "graph":
+					fresh.GraphComplete = false
+				case "source-error":
+					return Snapshot{}, errors.New("resnapshot failed")
+				}
+				return fresh, nil
+			}}
+			if err := r.Repo.Save(st); err != nil {
+				t.Fatal(err)
+			}
+			if err := r.invalidatePin(&st, want, errors.New("pin telemetry unavailable")); err == nil {
+				t.Fatal("pin error ignored")
+			}
+			global := failure != "target"
+			saved, err := r.Repo.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if calls != 1 || !saved.Records[key].OrphanSince.IsZero() || !saved.Records[key].QuietSince.IsZero() {
+				t.Fatal("pin failure did not resnapshot and persist target reset")
+			}
+			if saved.Records[otherKey].OrphanSince.IsZero() != global {
+				t.Fatal("wrong pin failure invalidation scope")
+			}
+			if !saved.Attempts[otherKey] || len(saved.Resources) != resourceCount {
+				t.Fatal("pin failure lost attempts or alert evidence")
+			}
+		})
+	}
+}
+func TestRevalidateFailureKeepsAttemptAndResetsContinuity(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("positive cleanup fixture requires Linux")
+	}
+	st, s, now := observeMature(t, nil, false)
+	now = now.Add(Defaults().Poll())
+	cfg := Defaults()
+	cfg.Cleanup = true
+	pins, signals, closed := 0, 0, 0
+	r := Runner{Config: cfg, Repo: Repository{Directory: t.TempDir()}, Now: func() time.Time { return now }, Source: func() (Snapshot, error) { return s, nil }, Pin: func(model.Process) (Pin, error) {
+		pins++
+		return &fakePin{revalidateErr: errors.New("pinned process I/O telemetry unavailable"), signals: &signals, closed: &closed}, nil
+	}}
+	if err := r.Repo.Save(st); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Once(&st); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := r.Repo.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := s.Processes[30].Key.String()
+	if signals != 0 || closed != 1 || !saved.Attempts[key] || !saved.Records[key].Attempted || !saved.Records[key].OrphanSince.IsZero() || !saved.Records[key].QuietSince.IsZero() {
+		t.Fatal("revalidation failure lost attempt/reset or leaked pin")
+	}
+	now = now.Add(cfg.Poll())
+	if err := r.Once(&st); err != nil {
+		t.Fatal(err)
+	}
+	if pins != 1 || signals != 0 {
+		t.Fatal("surviving attempted identity retried")
+	}
+}
