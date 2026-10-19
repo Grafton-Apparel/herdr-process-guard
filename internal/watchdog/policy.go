@@ -239,14 +239,16 @@ func Observe(st *State, s Snapshot, now time.Time, c Config) []Event {
 		k := p.Key.String()
 		old, ok := st.Resources[k]
 		high := p.RSSBytes >= c.RSSBytes
-		if ok && continuous && exact(old.Last, p) && now.After(old.Seen) {
+		if ok && continuous && old.Last.Key == p.Key && old.Last.UID == p.UID && now.After(old.Seen) {
 			cpu := float64(p.CPUTimeMillis-old.Last.CPUTimeMillis) / float64(now.Sub(old.Seen).Milliseconds()) * 100
 			high = high || cpu >= c.CPUPercent
 		}
 		r := Resource{Last: p, Seen: now}
-		if high && telemetry(p) {
+		// Alerts need a stable current-user stat identity, not cleanup eligibility.
+		// Socket, I/O, executable and child metadata gaps must not hide resource use.
+		if high && p.Key.PID > 0 && p.Key.BootID != "" && p.Key.StartTicks > 0 && p.UID >= 0 && p.CPUTimeMillis >= 0 && !strings.Contains(p.State, "Z") {
 			r.Since = old.Since
-			if !ok || !continuous || !exact(old.Last, p) || r.Since.IsZero() {
+			if !ok || !continuous || old.Last.Key != p.Key || old.Last.UID != p.UID || r.Since.IsZero() {
 				r.Since = now
 			}
 			if now.Sub(r.Since) >= c.ResourceWindow() {

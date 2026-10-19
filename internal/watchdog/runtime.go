@@ -85,23 +85,67 @@ func (r *Runner) Once(st *State) error {
 	}
 	return nil
 }
-func (r *Runner) validate(st State, want Candidate) (Candidate, error) {
+func (r *Runner) validate(st *State, want Candidate, attempted bool) (Candidate, error) {
 	if r.Context != nil && r.Context.Err() != nil {
 		return Candidate{}, r.Context.Err()
 	}
-	s, err := r.Source()
+	snapshot, err := r.Source()
 	if err != nil {
-		return Candidate{}, err
+		return Candidate{}, r.invalidate(st, Snapshot{}, want, err)
 	}
-	for _, got := range Candidates(st, s, r.Now().UTC(), r.Config) {
+	policy := *st
+	if attempted {
+		policy.Records = make(map[string]Record, len(st.Records))
+		for key, record := range st.Records {
+			policy.Records[key] = record
+		}
+		policy.Attempts = make(map[string]bool, len(st.Attempts))
+		for key, value := range st.Attempts {
+			policy.Attempts[key] = value
+		}
+		for _, member := range want.Members {
+			key := member.Key.String()
+			record := policy.Records[key]
+			record.Attempted = false
+			policy.Records[key] = record
+			delete(policy.Attempts, key)
+		}
+	}
+	for _, got := range Candidates(policy, snapshot, r.Now().UTC(), r.Config) {
 		if got.Root == want.Root && SameCandidate(want, got) {
 			return got, nil
 		}
 	}
-	return Candidate{}, errors.New("fresh session, policy, activity or tree validation rejected cleanup")
+	return Candidate{}, r.invalidate(st, snapshot, want, errors.New("fresh session, policy, activity or tree validation rejected cleanup"))
+}
+
+// Rejected preflight evidence breaks continuity before another poll can reuse it.
+// Preserve attempts, alert evidence and unrelated complete trees.
+func (r *Runner) invalidate(st *State, snapshot Snapshot, want Candidate, reason error) error {
+	global := !snapshot.Complete || !snapshot.GraphComplete
+	target := map[string]bool{}
+	for _, member := range want.Members {
+		target[member.Key.String()] = true
+	}
+	for key, record := range st.Records {
+		if !global && !target[key] {
+			continue
+		}
+		record.OrphanSince = time.Time{}
+		record.QuietSince = time.Time{}
+		record.Seen = time.Time{}
+		if process, ok := snapshot.Processes[record.Last.Key.PID]; ok && exact(record.Last, process) {
+			record.Last = process
+		}
+		st.Records[key] = record
+	}
+	if err := r.Repo.Save(*st); err != nil {
+		return fmt.Errorf("%w; persist rejected evidence: %v", reason, err)
+	}
+	return reason
 }
 func (r *Runner) cleanup(st *State, want Candidate) error {
-	if _, err := r.validate(*st, want); err != nil {
+	if _, err := r.validate(st, want, false); err != nil {
 		return err
 	}
 	pins := []Pin{}
@@ -117,7 +161,7 @@ func (r *Runner) cleanup(st *State, want Candidate) error {
 		}
 		pins = append(pins, pin)
 	}
-	if _, err := r.validate(*st, want); err != nil {
+	if _, err := r.validate(st, want, false); err != nil {
 		return err
 	}
 	latest, err := r.Repo.Load()
@@ -142,14 +186,7 @@ func (r *Runner) cleanup(st *State, want Candidate) error {
 		return err
 	}
 	// State writes can stall. Recheck all sessions and marks after durable writes.
-	validation := *st
-	validation.Records = map[string]Record{}
-	validation.Attempts = map[string]bool{}
-	for k, v := range st.Records {
-		v.Attempted = false
-		validation.Records[k] = v
-	}
-	if _, err = r.validate(validation, want); err != nil {
+	if _, err = r.validate(st, want, true); err != nil {
 		return err
 	}
 	latest, err = r.Repo.Load()

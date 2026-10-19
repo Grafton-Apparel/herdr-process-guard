@@ -6,6 +6,8 @@ import (
 	"github.com/Efeguclu1/herdr-process-guard/internal/model"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -63,6 +65,9 @@ func (p *fakePin) Revalidate() error { return p.revalidateErr }
 func (p *fakePin) SIGTERM() error    { *p.signals++; return nil }
 func (p *fakePin) Close() error      { *p.closed++; return nil }
 func TestCleanupFreshSnapshotsPinsIntentionalAndAttempts(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("positive cleanup fixture requires Linux")
+	}
 	for _, failure := range []string{"none", "fresh-session-gap", "new-child", "marked", "pin", "revalidate", "pause", "activity"} {
 		t.Run(failure, func(t *testing.T) {
 			st, s, now := observeMature(t, nil, false)
@@ -197,6 +202,9 @@ func TestRuntimeEventsDeduplicateAndPersistDeliveryCooldown(t *testing.T) {
 	}
 }
 func TestShutdownBeforeSignalCancelsCleanup(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("positive cleanup fixture requires Linux")
+	}
 	st, s, now := observeMature(t, nil, false)
 	now = now.Add(Defaults().Poll())
 	ctx, cancel := context.WithCancel(context.Background())
@@ -219,6 +227,9 @@ func TestShutdownBeforeSignalCancelsCleanup(t *testing.T) {
 	}
 }
 func TestAttemptWriteFailurePreventsSignal(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("positive cleanup fixture requires Linux")
+	}
 	if os.Geteuid() == 0 {
 		t.Skip("permission fixture requires unprivileged user")
 	}
@@ -255,5 +266,197 @@ func TestAttemptWriteFailurePreventsSignal(t *testing.T) {
 	}
 	if len(saved.Attempts) != 0 {
 		t.Fatal("uncommitted attempt reached disk")
+	}
+}
+
+func TestFreshPreflightGapRestartsOrphanWindowBeforeNextPoll(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("positive cleanup fixture requires Linux")
+	}
+	for _, failure := range []string{"session", "graph", "source-error", "socket", "I/O", "connection", "new-child"} {
+		t.Run(failure, func(t *testing.T) {
+			st, s, now := observeMature(t, nil, false)
+			now = now.Add(Defaults().Poll())
+			cfg := Defaults()
+			cfg.Cleanup = true
+			calls, signals, closed := 0, 0, 0
+			r := Runner{Config: cfg, Repo: Repository{Directory: t.TempDir()}, Now: func() time.Time { return now }, Source: func() (Snapshot, error) {
+				calls++
+				fresh := s
+				if calls == 2 {
+					fresh.Processes = make(map[int]model.Process, len(s.Processes))
+					for key, p := range s.Processes {
+						fresh.Processes[key] = p
+					}
+					p := fresh.Processes[30]
+					switch failure {
+					case "session":
+						fresh.Complete = false
+					case "graph":
+						fresh.GraphComplete = false
+					case "source-error":
+						return Snapshot{}, errors.New("source failed")
+					case "socket":
+						p.SocketsComplete = false
+						p.TelemetryComplete = false
+					case "I/O":
+						p.IOComplete = false
+						p.TelemetryComplete = false
+					case "connection":
+						p.Sockets = []model.Socket{{State: "ESTABLISHED"}}
+					case "new-child":
+						p.Children = []int{999}
+					}
+					fresh.Processes[30] = p
+				}
+				return fresh, nil
+			}, Pin: func(model.Process) (Pin, error) { return &fakePin{signals: &signals, closed: &closed}, nil }, Sleep: func(time.Duration) {}}
+			if err := r.Repo.Save(st); err != nil {
+				t.Fatal(err)
+			}
+			if err := r.Once(&st); err != nil {
+				t.Fatal(err)
+			}
+			now = now.Add(cfg.Poll())
+			if err := r.Once(&st); err != nil {
+				t.Fatal(err)
+			}
+			if signals != 0 {
+				t.Fatalf("fresh %s gap kept mature evidence: %d signals on next poll", failure, signals)
+			}
+			record := st.Records[s.Processes[30].Key.String()]
+			if !record.OrphanSince.Equal(now) || !record.QuietSince.Equal(now) {
+				t.Fatal("gap did not restart continuous evidence", record.OrphanSince, record.QuietSince)
+			}
+			saved, err := r.Repo.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !saved.Records[s.Processes[30].Key.String()].OrphanSince.Equal(now) {
+				t.Fatal("new window not persisted")
+			}
+		})
+	}
+}
+func TestNonLinuxCleanupRejectsBeforePinning(t *testing.T) {
+	if runtime.GOOS == "linux" {
+		t.Skip("non-Linux cleanup contract")
+	}
+	st, s, now := observeMature(t, nil, false)
+	now = now.Add(Defaults().Poll())
+	cfg := Defaults()
+	cfg.Cleanup = true
+	pinned := false
+	r := Runner{Config: cfg, Repo: Repository{Directory: t.TempDir()}, Now: func() time.Time { return now }, Source: func() (Snapshot, error) { return s, nil }, Pin: func(model.Process) (Pin, error) { pinned = true; return nil, errors.New("must not pin") }}
+	if err := r.Repo.Save(st); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Once(&st); err == nil || !strings.Contains(err.Error(), "requires Linux") {
+		t.Fatalf("unsupported cleanup: %v", err)
+	}
+	if pinned || len(st.Attempts) > 0 {
+		t.Fatal("unsupported cleanup reached pin/attempt path")
+	}
+}
+
+func TestRejectedPreflightResetsContinuityAtFailureScope(t *testing.T) {
+	for _, failure := range []string{"session", "graph", "source-error", "socket", "I/O", "connection", "new-child"} {
+		t.Run(failure, func(t *testing.T) {
+			st, s, now := observeMature(t, nil, false)
+			other := proc(40, 1, "other-helper")
+			s.Processes[40] = other
+			firstKey := s.Processes[30].Key.String()
+			otherKey := other.Key.String()
+			record := st.Records[firstKey]
+			record.Last = other
+			record.Socket = "/other"
+			record.Pane = "other-pane"
+			st.Records[otherKey] = record
+			st.Attempts[otherKey] = true
+			want := Candidates(st, s, now, Defaults())[0]
+			fresh := s
+			switch failure {
+			case "session":
+				fresh.Complete = false
+			case "graph":
+				fresh.GraphComplete = false
+			case "socket":
+				p := fresh.Processes[30]
+				p.SocketsComplete = false
+				p.TelemetryComplete = false
+				fresh.Processes[30] = p
+			case "I/O":
+				p := fresh.Processes[30]
+				p.IOComplete = false
+				p.TelemetryComplete = false
+				fresh.Processes[30] = p
+			case "connection":
+				p := fresh.Processes[30]
+				p.Sockets = []model.Socket{{State: "ESTABLISHED"}}
+				fresh.Processes[30] = p
+			case "new-child":
+				p := fresh.Processes[30]
+				p.Children = []int{999}
+				fresh.Processes[30] = p
+			}
+			r := Runner{Config: Defaults(), Repo: Repository{Directory: t.TempDir()}, Now: func() time.Time { return now }, Source: func() (Snapshot, error) {
+				if failure == "source-error" {
+					return Snapshot{}, errors.New("source failed")
+				}
+				return fresh, nil
+			}}
+			if err := r.Repo.Save(st); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := r.validate(&st, want, false); err == nil {
+				t.Fatal("unsafe fresh evidence accepted")
+			}
+			if !st.Records[firstKey].OrphanSince.IsZero() || !st.Records[firstKey].QuietSince.IsZero() {
+				t.Fatal("target continuity survived fresh rejection")
+			}
+			global := failure == "session" || failure == "graph" || failure == "source-error"
+			if st.Records[otherKey].OrphanSince.IsZero() != global {
+				t.Fatal("wrong invalidation scope for unrelated tree")
+			}
+			saved, err := r.Repo.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !saved.Records[firstKey].OrphanSince.IsZero() || !saved.Attempts[otherKey] {
+				t.Fatal("invalidation not durable or attempt suppression lost")
+			}
+		})
+	}
+}
+func TestFinalPreflightGapKeepsDurableAttemptAndResetsContinuity(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("positive cleanup fixture requires Linux")
+	}
+	st, s, now := observeMature(t, nil, false)
+	now = now.Add(Defaults().Poll())
+	cfg := Defaults()
+	cfg.Cleanup = true
+	calls, signals, closed := 0, 0, 0
+	r := Runner{Config: cfg, Repo: Repository{Directory: t.TempDir()}, Now: func() time.Time { return now }, Source: func() (Snapshot, error) {
+		calls++
+		fresh := s
+		if calls == 4 {
+			fresh.Complete = false
+		}
+		return fresh, nil
+	}, Pin: func(model.Process) (Pin, error) { return &fakePin{signals: &signals, closed: &closed}, nil }}
+	if err := r.Repo.Save(st); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Once(&st); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := r.Repo.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := s.Processes[30].Key.String()
+	if signals != 0 || closed != 1 || !saved.Attempts[key] || !saved.Records[key].Attempted || !saved.Records[key].OrphanSince.IsZero() {
+		t.Fatal("final gap lost suppression/continuity or allowed signaling")
 	}
 }

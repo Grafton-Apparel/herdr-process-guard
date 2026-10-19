@@ -224,3 +224,76 @@ func TestResourceAlertsContinueAcrossUnrelatedSessionGaps(t *testing.T) {
 		t.Fatal("resource alerts suppressed by unrelated snapshot gap", count)
 	}
 }
+
+func TestResourceAlertsWithTargetTelemetryGapsKeepCleanupBlocked(t *testing.T) {
+	for _, metric := range []string{"CPU", "RSS"} {
+		for _, gap := range []string{"socket", "I/O"} {
+			t.Run(metric+"/"+gap, func(t *testing.T) {
+				c := Defaults()
+				st := NewState()
+				now := time.Unix(10000, 0)
+				Observe(&st, liveFixture(), now, c)
+				s := orphanFixture()
+				count := 0
+				for i := 1; i <= 63; i++ {
+					p := s.Processes[30]
+					p.TelemetryComplete = false
+					if gap == "socket" {
+						p.SocketsComplete = false
+					} else {
+						p.IOComplete = false
+					}
+					if metric == "CPU" {
+						p.CPUTimeMillis += int64(c.PollSeconds) * 1000
+					} else {
+						p.RSSBytes = c.RSSBytes
+					}
+					s.Processes[30] = p
+					at := now.Add(time.Duration(i) * c.Poll())
+					for _, event := range Observe(&st, s, at, c) {
+						if event.Kind == "resource" && event.PID == 30 {
+							count++
+						}
+					}
+					if len(Candidates(st, s, at, c)) != 0 {
+						t.Fatal("target telemetry gap permitted cleanup")
+					}
+				}
+				if count != 1 {
+					t.Fatalf("sustained %s alert with %s gap: got %d want 1", metric, gap, count)
+				}
+			})
+		}
+	}
+}
+
+func TestResourceAlertsUseStatIdentityDuringExecutableGaps(t *testing.T) {
+	c := Defaults()
+	st := NewState()
+	s := liveFixture()
+	now := time.Unix(10000, 0)
+	count := 0
+	for i := 0; i < 12; i++ {
+		p := s.Processes[30]
+		p.RSSBytes = c.RSSBytes
+		p.TelemetryComplete = false
+		if i%2 == 0 {
+			p.Executable = ""
+			p.ExecutableInode = 0
+			p.CommandHash = ""
+		} else {
+			p.Executable = "/bin/helper"
+			p.ExecutableInode = 30
+			p.CommandHash = "helper"
+		}
+		s.Processes[30] = p
+		for _, event := range Observe(&st, s, now.Add(time.Duration(i)*c.Poll()), c) {
+			if event.Kind == "resource" && event.PID == 30 {
+				count++
+			}
+		}
+	}
+	if count != 1 {
+		t.Fatalf("stat identity lost resource history across metadata gaps: %d alerts", count)
+	}
+}
