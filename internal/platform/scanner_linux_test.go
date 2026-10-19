@@ -485,6 +485,81 @@ func TestLinuxThreadLocalSocketIsObserved(t *testing.T) {
 	}
 }
 
+func fixtureNetworkNamespace(t *testing.T, s *Scanner, tid int, name string) {
+	t.Helper()
+	writeFixture(t, s.ProcRoot, name, "namespace fixture")
+	path := filepath.Join(s.ProcRoot, "42/task", fmt.Sprint(tid), "ns/net")
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(s.ProcRoot, name), path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLinuxSocketTablesShareOnlyVerifiedNamespaceAndFDSet(t *testing.T) {
+	for _, kind := range []string{"shared", "separate", "unknown", "different-fds"} {
+		t.Run(kind, func(t *testing.T) {
+			s := procFixture(t)
+			fixtureProcess(t, s, 42)
+			fixtureThread(t, s, 42, 43)
+			if kind != "unknown" {
+				fixtureNetworkNamespace(t, s, 42, "netns-one")
+				other := "netns-one"
+				if kind == "separate" {
+					other = "netns-two"
+				}
+				fixtureNetworkNamespace(t, s, 43, other)
+			}
+			if kind == "different-fds" {
+				writeFixture(t, s.ProcRoot, "42/net/tcp", "header\n 0: 0100007F:1F90 0200007F:C350 01 0:0 0:0 0 0 0 12345\n")
+				if err := os.Symlink("socket:[12345]", filepath.Join(s.ProcRoot, "42/task/43/fd/3")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			reads := 0
+			sockets, err := readProcessSocketsWithTables(filepath.Join(s.ProcRoot, "42"), s.UID, func(dir string, wanted map[string]bool) ([]model.Socket, error) {
+				reads++
+				return readSocketTables(dir, wanted)
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantReads := 2
+			if kind == "shared" {
+				wantReads = 1
+			}
+			if reads != wantReads {
+				t.Fatalf("table snapshots = %d, want %d", reads, wantReads)
+			}
+			if kind == "different-fds" && (len(sockets) != 1 || sockets[0].State != "ESTABLISHED") {
+				t.Fatalf("thread-local connection omitted: %+v", sockets)
+			}
+		})
+	}
+}
+
+func TestLinuxSocketTablesRejectNamespaceChange(t *testing.T) {
+	s := procFixture(t)
+	fixtureProcess(t, s, 42)
+	fixtureNetworkNamespace(t, s, 42, "netns-one")
+	writeFixture(t, s.ProcRoot, "netns-two", "other namespace")
+	_, err := readProcessSocketsWithTables(filepath.Join(s.ProcRoot, "42"), s.UID, func(dir string, wanted map[string]bool) ([]model.Socket, error) {
+		found, err := readSocketTables(dir, wanted)
+		path := filepath.Join(dir, "ns/net")
+		if e := os.Remove(path); e != nil {
+			t.Fatal(e)
+		}
+		if e := os.Symlink(filepath.Join(s.ProcRoot, "netns-two"), path); e != nil {
+			t.Fatal(e)
+		}
+		return found, err
+	})
+	if err == nil {
+		t.Fatal("namespace changed during cached socket snapshot")
+	}
+}
+
 func TestLinuxSamePathExecReplacementIsRejected(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "helper")

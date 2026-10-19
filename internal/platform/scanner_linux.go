@@ -508,24 +508,81 @@ func socketInodes(dir string, remaining *int) (map[string]bool, error) {
 	return wanted, nil
 }
 func readProcessSockets(dir string, uid int) ([]model.Socket, error) {
+	return readProcessSocketsWithTables(dir, uid, readSocketTables)
+}
+
+type networkNamespaceIdentity struct{ device, inode uint64 }
+
+func namespaceIdentity(path string) (networkNamespaceIdentity, error) {
+	var st unix.Stat_t
+	if err := unix.Stat(path, &st); err != nil {
+		return networkNamespaceIdentity{}, err
+	}
+	return networkNamespaceIdentity{uint64(st.Dev), st.Ino}, nil
+}
+
+func readProcessSocketsWithTables(dir string, uid int, tables func(string, map[string]bool) ([]model.Socket, error)) ([]model.Socket, error) {
 	before, err := readThreadIdentities(dir, uid)
 	if err != nil {
 		return nil, err
 	}
 	perThread := map[int]map[string]bool{}
+	namespaces := map[int]networkNamespaceIdentity{}
+	held := map[networkNamespaceIdentity]*os.File{}
+	defer func() {
+		for _, f := range held {
+			_ = f.Close()
+		}
+	}()
+	type tableKey struct {
+		namespace networkNamespaceIdentity
+		inodes    string
+	}
+	cache := map[tableKey][]model.Socket{}
 	remaining := maxProcEntries
 	sockets := []model.Socket{}
 	seen := map[model.Socket]bool{}
 	for _, thread := range before {
 		task := filepath.Join(dir, "task", strconv.Itoa(thread.TID))
+		// Pin namespace identities so their inode cannot be recycled while this
+		// process snapshot reuses a table. Unknown namespaces stay uncached.
+		var namespace networkNamespaceIdentity
+		knownNamespace := false
+		if f, openErr := os.Open(filepath.Join(task, "ns", "net")); openErr == nil {
+			var st unix.Stat_t
+			if statErr := unix.Fstat(int(f.Fd()), &st); statErr == nil && st.Ino != 0 {
+				namespace = networkNamespaceIdentity{uint64(st.Dev), st.Ino}
+				namespaces[thread.TID] = namespace
+				knownNamespace = true
+				if _, exists := held[namespace]; !exists {
+					held[namespace] = f
+				} else {
+					_ = f.Close()
+				}
+			} else {
+				_ = f.Close()
+			}
+		}
 		wanted, err := socketInodes(task, &remaining)
 		if err != nil {
 			return nil, err
 		}
 		perThread[thread.TID] = wanted
-		found, err := readSocketTables(task, wanted)
-		if err != nil {
-			return nil, err
+		inodes := make([]string, 0, len(wanted))
+		for inode := range wanted {
+			inodes = append(inodes, inode)
+		}
+		sort.Strings(inodes)
+		key := tableKey{namespace, strings.Join(inodes, ",")}
+		found, cached := cache[key]
+		if !knownNamespace || !cached {
+			found, err = tables(task, wanted)
+			if err != nil {
+				return nil, err
+			}
+			if knownNamespace {
+				cache[key] = found
+			}
 		}
 		for _, socket := range found {
 			if !seen[socket] {
@@ -544,7 +601,8 @@ func readProcessSockets(dir string, uid int) ([]model.Socket, error) {
 	remaining = maxProcEntries
 	for _, thread := range after {
 		wanted := perThread[thread.TID]
-		current, err := socketInodes(filepath.Join(dir, "task", strconv.Itoa(thread.TID)), &remaining)
+		task := filepath.Join(dir, "task", strconv.Itoa(thread.TID))
+		current, err := socketInodes(task, &remaining)
 		if err != nil {
 			return nil, err
 		}
@@ -554,6 +612,12 @@ func readProcessSockets(dir string, uid int) ([]model.Socket, error) {
 		for inode := range current {
 			if !wanted[inode] {
 				return nil, errors.New("thread socket descriptors changed during read")
+			}
+		}
+		if namespace, known := namespaces[thread.TID]; known {
+			current, err := namespaceIdentity(filepath.Join(task, "ns", "net"))
+			if err != nil || current != namespace {
+				return nil, errors.New("thread network namespace changed during socket read")
 			}
 		}
 	}
