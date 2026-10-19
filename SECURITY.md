@@ -12,7 +12,7 @@ confirmation, or escape its Herdr pane/workspace scope.
 Use GitHub's private vulnerability reporting for this repository. Include:
 
 - Process Guard and Herdr versions
-- macOS version and architecture
+- Linux kernel or macOS version and architecture
 - the smallest reproducible process tree
 - expected and observed target identities
 - whether any signal was actually sent
@@ -30,3 +30,9 @@ pre-1.0; users should upgrade before reporting a fixed-version regression.
 Process Guard is a local developer tool, not a privilege boundary. It runs as
 the current user and can only inspect or signal processes available to that
 user. It never requests elevated privileges and does not send telemetry.
+
+Automatic cleanup defaults off. The Linux watchdog uses kernel boot/start
+identities, executable device/inode, argv hashes, complete tree validation and
+pidfds. It sends SIGTERM only. Missing session or ancestry evidence suspends
+cleanup; missing target telemetry blocks that tree. Report any case that
+bypasses intentional marks, paused cleanup or durable attempt suppression.

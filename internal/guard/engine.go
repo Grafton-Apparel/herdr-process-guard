@@ -28,7 +28,7 @@ func New() (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	directory, err := store.DefaultDirectory()
+	directory, err := store.SessionDirectory(client.SocketPath)
 	if err != nil {
 		return nil, fmt.Errorf("resolve state directory: %w", err)
 	}

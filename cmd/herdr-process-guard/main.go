@@ -15,7 +15,7 @@ import (
 	"github.com/Efeguclu1/herdr-process-guard/internal/ui"
 )
 
-const version = "0.1.3"
+const version = "0.2.0"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -36,6 +36,9 @@ func run(args []string) error {
 	if command == "help" || command == "--help" || command == "-h" {
 		printHelp()
 		return nil
+	}
+	if handled, err := watchdogCommand(command, args); handled {
+		return err
 	}
 	engine, err := guard.New()
 	if err != nil {
@@ -116,6 +119,15 @@ Usage:
   herdr-process-guard mark-intentional <pid>
   herdr-process-guard unmark-intentional <pid>
   herdr-process-guard snapshot --reason <event>
+  herdr-process-guard watch [--config <path>]
+  herdr-process-guard watch-once [--config <path>]
+  herdr-process-guard watchdog-status [--json]
+  herdr-process-guard watchdog-report
+  herdr-process-guard watchdog-dashboard
+  herdr-process-guard watchdog-config
+  herdr-process-guard pause | resume
+  herdr-process-guard service-install | service-start | service-stop
+  herdr-process-guard service-status | service-ensure | service-uninstall
 
 Stopping is interactive. There is deliberately no --yes flag.
 `)
