@@ -5,6 +5,13 @@ Versioning while pre-1.0 APIs remain explicitly unstable.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-27
+
+- Scan each shared file descriptor table and each network namespace's socket
+  tables once per snapshot instead of once per thread and per process. A
+  snapshot of 260 processes and 2,500 threads drops from 9.5 s to 2.3 s; the
+  post-read identity checks are unchanged.
+
 ## [0.2.0] - 2026-10-19
 
 - Add native Linux telemetry and pinned SIGTERM identities.
@@ -30,6 +37,7 @@ Versioning while pre-1.0 APIs remain explicitly unstable.
   workload active indefinitely.
 - Stop previews continue to require exact PID/start-time and tree membership.
 
-[Unreleased]: https://github.com/Grafton-Apparel/herdr-process-guard/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Grafton-Apparel/herdr-process-guard/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/Grafton-Apparel/herdr-process-guard/releases/tag/v0.2.1
 [0.2.0]: https://github.com/Grafton-Apparel/herdr-process-guard/releases/tag/v0.2.0
 [0.1.3]: https://github.com/Efeguclu1/herdr-process-guard/releases/tag/v0.1.3

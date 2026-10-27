@@ -34,7 +34,7 @@ download a release binary; Go 1.24+ is only required for source development or
 as an installation fallback.
 
 ```sh
-herdr plugin install Grafton-Apparel/herdr-process-guard --ref v0.2.0 --yes
+herdr plugin install Grafton-Apparel/herdr-process-guard --ref v0.2.1 --yes
 herdr plugin pane open --plugin herdr.process-guard --entrypoint dashboard
 ```
 

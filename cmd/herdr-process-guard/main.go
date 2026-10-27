@@ -15,7 +15,7 @@ import (
 	"github.com/Efeguclu1/herdr-process-guard/internal/ui"
 )
 
-const version = "0.2.0"
+const version = "0.2.1"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
