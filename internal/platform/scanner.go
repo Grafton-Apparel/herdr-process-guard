@@ -28,6 +28,8 @@ type Scanner struct {
 	// GraphComplete describes ancestry enumeration from the last native snapshot.
 	// Per-process metadata warnings do not imply a graph gap. Read after Processes.
 	GraphComplete bool
+	// socketTables shares parsed socket tables within one native snapshot.
+	socketTables *socketTableCache
 }
 
 func NewScanner() *Scanner {
