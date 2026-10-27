@@ -1,6 +1,6 @@
 id = "herdr.process-guard"
 name = "Process Guard"
-version = "0.2.0"
+version = "0.2.1"
 min_herdr_version = "0.9.5"
 description = "Inspect agent workloads and monitor conservative Linux orphan cleanup"
 platforms = ["linux", "macos"]
