@@ -10,3 +10,6 @@ import (
 func (s *Scanner) processesNative() (map[int]model.Process, []string, error) {
 	return nil, nil, errors.New("native procfs collection requires Linux")
 }
+
+// socketTableCache is only used by the Linux procfs scanner.
+type socketTableCache struct{}
