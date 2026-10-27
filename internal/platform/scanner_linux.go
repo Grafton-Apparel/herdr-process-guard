@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/Efeguclu1/herdr-process-guard/internal/model"
 	"golang.org/x/sys/unix"
@@ -160,6 +161,10 @@ func readUID(path string) (int, error) {
 	if err != nil {
 		return -1, err
 	}
+	return parseUID(b)
+}
+
+func parseUID(b []byte) (int, error) {
 	for _, line := range strings.Split(string(b), "\n") {
 		f := strings.Fields(line)
 		if len(f) > 0 && f[0] == "Uid:" {
@@ -233,6 +238,8 @@ func (s *Scanner) processesNative() (map[int]model.Process, []string, error) {
 	processes := map[int]model.Process{}
 	s.GraphComplete = true
 	warnings := []string{}
+	s.socketTables = newSocketTableCache()
+	defer func() { s.socketTables.Close(); s.socketTables = nil }()
 	for _, entry := range entries {
 		pid, err := strconv.Atoi(entry.Name())
 		if err != nil || pid <= 0 {
@@ -337,7 +344,7 @@ func (s *Scanner) readProcess(pid int, boot string, bootTime int64, ticks uint64
 	} else {
 		p.IOComplete = true
 	}
-	p.Sockets, err = readProcessSockets(dir, uid)
+	p.Sockets, err = s.readProcessSockets(dir, uid)
 	if err != nil {
 		gaps = append(gaps, fmt.Errorf("sockets unavailable: %w", err))
 	} else {
@@ -493,13 +500,13 @@ func readThreadIdentities(dir string, uid int) ([]threadIdentity, error) {
 		if err != nil || identity.pid != tid {
 			return nil, errors.New("invalid thread identity")
 		}
-		taskUID, err := readUID(filepath.Join(task, "status"))
-		if err != nil || taskUID != uid {
-			return nil, errors.New("thread credentials unavailable or changed")
-		}
 		status, err := readBounded(filepath.Join(task, "status"))
 		if err != nil {
 			return nil, err
+		}
+		taskUID, err := parseUID(status)
+		if err != nil || taskUID != uid {
+			return nil, errors.New("thread credentials unavailable or changed")
 		}
 		tgid := 0
 		for _, line := range strings.Split(string(status), "\n") {
@@ -551,8 +558,38 @@ func socketInodes(dir string, remaining *int) (map[string]bool, error) {
 	}
 	return wanted, nil
 }
-func readProcessSockets(dir string, uid int) ([]model.Socket, error) {
-	return readProcessSocketsWithTables(dir, uid, readSocketTables)
+
+// fileTableComparer reports whether two tasks share one file descriptor table.
+// Threads normally do (CLONE_FILES), so a single fd directory scan covers them.
+type fileTableComparer func(tidA, tidB int) (bool, error)
+
+const kcmpFiles = 2 // KCMP_FILES in <linux/kcmp.h>
+
+func kcmpSameFiles(a, b int) (bool, error) {
+	r, _, errno := unix.Syscall6(unix.SYS_KCMP, uintptr(a), uintptr(b), kcmpFiles, 0, 0, 0)
+	if errno != 0 {
+		return false, errno
+	}
+	return r == 0, nil
+}
+
+// kcmp takes task IDs in the caller's PID namespace, which only the live
+// procfs of that namespace lists. Fixtures and foreign procfs scan every thread.
+var callerPIDNamespace = sync.OnceValue(procUsesCallerPIDNamespace)
+
+func (s *Scanner) fileTables() fileTableComparer {
+	if s.procRoot() == "/proc" && callerPIDNamespace() {
+		return kcmpSameFiles
+	}
+	return nil
+}
+
+func (s *Scanner) readProcessSockets(dir string, uid int) ([]model.Socket, error) {
+	tables := readSocketTables
+	if s.socketTables != nil {
+		tables = s.socketTables.read
+	}
+	return readProcessSocketsWith(dir, uid, tables, s.fileTables())
 }
 
 type networkNamespaceIdentity struct{ device, inode uint64 }
@@ -566,11 +603,20 @@ func namespaceIdentity(path string) (networkNamespaceIdentity, error) {
 }
 
 func readProcessSocketsWithTables(dir string, uid int, tables func(string, map[string]bool) ([]model.Socket, error)) ([]model.Socket, error) {
+	return readProcessSocketsWith(dir, uid, tables, nil)
+}
+
+func readProcessSocketsWith(dir string, uid int, tables func(string, map[string]bool) ([]model.Socket, error), sameFiles fileTableComparer) ([]model.Socket, error) {
 	before, err := readThreadIdentities(dir, uid)
 	if err != nil {
 		return nil, err
 	}
-	perThread := map[int]map[string]bool{}
+	// perTable holds the socket inodes of each scanned fd table, keyed by the
+	// thread that was scanned; tableOf maps every thread to that thread.
+	perTable := map[int]map[string]bool{}
+	tableKeys := map[int]string{}
+	tableOf := map[int]int{}
+	scanned := []int{}
 	namespaces := map[int]networkNamespaceIdentity{}
 	held := map[networkNamespaceIdentity]*os.File{}
 	defer func() {
@@ -607,17 +653,32 @@ func readProcessSocketsWithTables(dir string, uid int, tables func(string, map[s
 				_ = f.Close()
 			}
 		}
-		wanted, err := socketInodes(task, &remaining)
-		if err != nil {
-			return nil, err
+		owner := thread.TID
+		if sameFiles != nil {
+			for _, candidate := range scanned {
+				if same, err := sameFiles(candidate, thread.TID); err == nil && same {
+					owner = candidate
+					break
+				}
+			}
 		}
-		perThread[thread.TID] = wanted
-		inodes := make([]string, 0, len(wanted))
-		for inode := range wanted {
-			inodes = append(inodes, inode)
+		tableOf[thread.TID] = owner
+		wanted, known := perTable[owner]
+		if !known {
+			wanted, err = socketInodes(task, &remaining)
+			if err != nil {
+				return nil, err
+			}
+			inodes := make([]string, 0, len(wanted))
+			for inode := range wanted {
+				inodes = append(inodes, inode)
+			}
+			sort.Strings(inodes)
+			perTable[owner] = wanted
+			tableKeys[owner] = strings.Join(inodes, ",")
+			scanned = append(scanned, owner)
 		}
-		sort.Strings(inodes)
-		key := tableKey{namespace, strings.Join(inodes, ",")}
+		key := tableKey{namespace, tableKeys[owner]}
 		found, cached := cache[key]
 		if !knownNamespace || !cached {
 			found, err = tables(task, wanted)
@@ -643,10 +704,9 @@ func readProcessSocketsWithTables(dir string, uid int, tables func(string, map[s
 		return nil, errors.New("thread identities changed during socket read")
 	}
 	remaining = maxProcEntries
-	for _, thread := range after {
-		wanted := perThread[thread.TID]
-		task := filepath.Join(dir, "task", strconv.Itoa(thread.TID))
-		current, err := socketInodes(task, &remaining)
+	for _, owner := range scanned {
+		wanted := perTable[owner]
+		current, err := socketInodes(filepath.Join(dir, "task", strconv.Itoa(owner)), &remaining)
 		if err != nil {
 			return nil, err
 		}
@@ -656,6 +716,14 @@ func readProcessSocketsWithTables(dir string, uid int, tables func(string, map[s
 		for inode := range current {
 			if !wanted[inode] {
 				return nil, errors.New("thread socket descriptors changed during read")
+			}
+		}
+	}
+	for _, thread := range after {
+		task := filepath.Join(dir, "task", strconv.Itoa(thread.TID))
+		if owner := tableOf[thread.TID]; owner != thread.TID {
+			if same, err := sameFiles(owner, thread.TID); err != nil || !same {
+				return nil, errors.New("thread file table changed during socket read")
 			}
 		}
 		if namespace, known := namespaces[thread.TID]; known {
@@ -676,19 +744,41 @@ func readProcessSocketsWithTables(dir string, uid int, tables func(string, map[s
 }
 
 func readSocketTables(dir string, wanted map[string]bool) ([]model.Socket, error) {
+	table, err := readSocketTable(dir)
+	if err != nil {
+		return nil, err
+	}
+	return table.resolve(wanted)
+}
 
+// socketTable is one read of a network namespace's tcp, tcp6, udp, udp6 and
+// unix tables. Network rows are decoded only for the inodes a process holds.
+type socketTable struct {
+	network []socketRow
+	unix    map[string]bool
+}
+
+type socketRow struct {
+	protocol string
+	fields   []string
+}
+
+func readSocketTable(dir string) (socketTable, error) {
 	// Reading the tables even with no FDs detects inaccessible socket telemetry.
-	sockets := []model.Socket{}
-	known := map[string]bool{}
+	table := socketTable{unix: map[string]bool{}}
 	for _, name := range []string{"tcp", "tcp6", "udp", "udp6", "unix"} {
 		data, err := readBounded(filepath.Join(dir, "net", name))
 		if err != nil {
-			return nil, err
+			return socketTable{}, err
 		}
 		lines := bufio.NewScanner(strings.NewReader(string(data)))
 		lines.Buffer(make([]byte, 4096), maxProcFile)
 		if !lines.Scan() {
-			return nil, fmt.Errorf("empty socket table %s", name)
+			return socketTable{}, fmt.Errorf("empty socket table %s", name)
+		}
+		protocol := "TCP"
+		if strings.HasPrefix(name, "udp") {
+			protocol = "UDP"
 		}
 		for lines.Scan() {
 			f := strings.Fields(lines.Text())
@@ -697,57 +787,115 @@ func readSocketTables(dir string, wanted map[string]bool) ([]model.Socket, error
 			}
 			if name == "unix" {
 				if len(f) < 7 {
-					return nil, errors.New("invalid unix socket row")
+					return socketTable{}, errors.New("invalid unix socket row")
 				}
-				if wanted[f[6]] {
-					known[f[6]] = true
-				}
+				table.unix[f[6]] = true
 				continue
 			}
 			if len(f) < 10 {
-				return nil, errors.New("invalid network socket row")
+				return socketTable{}, errors.New("invalid network socket row")
 			}
-			inode := f[9]
-			if !wanted[inode] {
-				continue
-			}
-			local, err := decodeEndpoint(f[1])
-			if err != nil {
-				return nil, err
-			}
-			remote, err := decodeEndpoint(f[2])
-			if err != nil {
-				return nil, err
-			}
-			protocol := "TCP"
-			if strings.HasPrefix(name, "udp") {
-				protocol = "UDP"
-			}
-			state := f[3]
-			stateValue, stateErr := strconv.ParseUint(state, 16, 8)
-			if stateErr != nil || len(state) != 2 || stateValue < 1 || stateValue > 12 {
-				return nil, errors.New("invalid socket state")
-			}
-			switch state {
-			case "01":
-				state = "ESTABLISHED"
-			case "0A":
-				state = "LISTEN"
-			}
-			endpoint := local
-			sockets = append(sockets, model.Socket{Protocol: protocol, Local: endpoint, State: state, Listen: state == "LISTEN" || (protocol == "UDP" && strings.HasSuffix(remote, ":0"))})
-			known[inode] = true
+			table.network = append(table.network, socketRow{protocol: protocol, fields: f})
 		}
 		if err := lines.Err(); err != nil {
+			return socketTable{}, err
+		}
+	}
+	return table, nil
+}
+
+var errUnresolvedSocket = errors.New("unresolved socket inode")
+
+func (t socketTable) resolve(wanted map[string]bool) ([]model.Socket, error) {
+	sockets := []model.Socket{}
+	known := map[string]bool{}
+	for inode := range wanted {
+		if t.unix[inode] {
+			known[inode] = true
+		}
+	}
+	for _, row := range t.network {
+		f := row.fields
+		inode := f[9]
+		if !wanted[inode] {
+			continue
+		}
+		local, err := decodeEndpoint(f[1])
+		if err != nil {
 			return nil, err
 		}
+		remote, err := decodeEndpoint(f[2])
+		if err != nil {
+			return nil, err
+		}
+		state := f[3]
+		stateValue, stateErr := strconv.ParseUint(state, 16, 8)
+		if stateErr != nil || len(state) != 2 || stateValue < 1 || stateValue > 12 {
+			return nil, errors.New("invalid socket state")
+		}
+		switch state {
+		case "01":
+			state = "ESTABLISHED"
+		case "0A":
+			state = "LISTEN"
+		}
+		sockets = append(sockets, model.Socket{Protocol: row.protocol, Local: local, State: state, Listen: state == "LISTEN" || (row.protocol == "UDP" && strings.HasSuffix(remote, ":0"))})
+		known[inode] = true
 	}
 	for inode := range wanted {
 		if !known[inode] {
-			return nil, fmt.Errorf("unresolved socket inode %s", inode)
+			return nil, fmt.Errorf("%w %s", errUnresolvedSocket, inode)
 		}
 	}
 	return sockets, nil
+}
+
+// socketTableCache shares parsed socket tables between the processes of one
+// scan. Each table belongs to a network namespace, held open until Close so
+// its inode cannot be recycled for another namespace mid-scan. A socket made
+// after the cached read is missing from it; that process gets a fresh read.
+type socketTableCache struct {
+	tables map[networkNamespaceIdentity]socketTable
+	held   []*os.File
+}
+
+func newSocketTableCache() *socketTableCache {
+	return &socketTableCache{tables: map[networkNamespaceIdentity]socketTable{}}
+}
+
+func (c *socketTableCache) Close() {
+	for _, f := range c.held {
+		_ = f.Close()
+	}
+	c.held = nil
+}
+
+func (c *socketTableCache) read(task string, wanted map[string]bool) ([]model.Socket, error) {
+	f, err := os.Open(filepath.Join(task, "ns", "net"))
+	if err != nil {
+		return readSocketTables(task, wanted)
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(int(f.Fd()), &st); err != nil || st.Ino == 0 {
+		_ = f.Close()
+		return readSocketTables(task, wanted)
+	}
+	namespace := networkNamespaceIdentity{uint64(st.Dev), st.Ino}
+	if table, ok := c.tables[namespace]; ok {
+		_ = f.Close()
+		sockets, err := table.resolve(wanted)
+		if !errors.Is(err, errUnresolvedSocket) {
+			return sockets, err
+		}
+	} else {
+		c.held = append(c.held, f)
+	}
+	table, err := readSocketTable(task)
+	if err != nil {
+		return nil, err
+	}
+	c.tables[namespace] = table
+	return table.resolve(wanted)
 }
 func decodeEndpoint(value string) (string, error) {
 	parts := strings.Split(value, ":")
